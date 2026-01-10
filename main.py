@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 # Если хочешь хранить токен в env — задай BOT_TOKEN в Render. Если нет, будет использован токен ниже.
 TOKEN = os.environ.get("BOT_TOKEN", "8419255009:AAES3WkfbLW9Gd1JrZiN8x5hQHFGA0EaRD0")
 # Укажи публичный URL вашего сервиса (Render) в WEBHOOK_URL env, например https://your-service.onrender.com
-WEBHOOK_BASE = os.environ.get("WEBHOOK_URL", "https://your-service.onrender.com")
+# Если WEBHOOK_URL не задан, используем переменную RENDER_EXTERNAL_URL (Render автоматически её выставляет).
+WEBHOOK_BASE = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL", "https://your-service.onrender.com")
 PORT = int(os.environ.get("PORT", 5000))
 
 COOLDOWN_SECONDS = 3600  # 1 час per-channel
