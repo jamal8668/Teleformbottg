@@ -1,14 +1,32 @@
 # main.py
 # Teleform — исправленная версия без функции "обычная заявка" (только через подключённые каналы)
 # Добавлен webhook (Flask). Токен берётся из переменных окружения или из заданного по умолчанию.
-# Требует: pip install pyTelegramBotAPI Flask gunicorn
+# Поддержка: PostgreSQL (через env DATABASE_URL). Если DATABASE_URL не задан — fallback на SQLite.
+# Требует: pip install pyTelegramBotAPI Flask gunicorn psycopg2-binary
 
 import os
-import sqlite3
 import time
 import logging
 from datetime import timedelta
 from flask import Flask, request, abort
+
+# DB drivers (Postgres optional)
+DATABASE_URL = os.environ.get("DATABASE_URL")
+USE_PG = bool(DATABASE_URL)
+
+if USE_PG:
+    import psycopg2
+    # connect to Postgres
+    try:
+        pg_conn = psycopg2.connect(DATABASE_URL)
+        db = pg_conn
+        cur = db.cursor()
+        logger = logging.getLogger(__name__)
+        logger.info("Using PostgreSQL database")
+    except Exception as e:
+        raise RuntimeError(f"Не удалось подключиться к Postgres: {e}")
+else:
+    import sqlite3
 
 import telebot
 from telebot import types
@@ -39,96 +57,173 @@ try:
 except Exception:
     BOT_USERNAME = None
 
-# ========== БД (с таймаутом) ==========
-db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-cur = db.cursor()
+# ========== БД ==========
+if USE_PG:
+    # Создадим таблицы в Postgres (с типами, совместимыми с исходной логикой)
+    def init_pg_tables():
+        # используем BIGINT для id пользователей/каналов и BIGINT created_at (epoch)
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS channels (
+            id SERIAL PRIMARY KEY,
+            owner_id BIGINT,
+            channel_id TEXT UNIQUE,
+            title TEXT,
+            created_at BIGINT
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS channel_admins (
+            id SERIAL PRIMARY KEY,
+            channel_dbid INTEGER,
+            admin_user_id BIGINT,
+            added_by BIGINT,
+            created_at BIGINT,
+            UNIQUE(channel_dbid, admin_user_id)
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS submissions (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            content_type TEXT,
+            text_content TEXT,
+            file_id TEXT,
+            status TEXT,
+            created_at BIGINT,
+            anonymous INTEGER DEFAULT 1,
+            target_channel_dbid INTEGER DEFAULT 0
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS cooldowns (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            channel_dbid INTEGER,
+            last_ts BIGINT,
+            UNIQUE(user_id, channel_dbid)
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS user_states (
+            user_id BIGINT PRIMARY KEY,
+            state TEXT,
+            updated_at BIGINT
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS bans (
+            id SERIAL PRIMARY KEY,
+            channel_dbid INTEGER,
+            user_id BIGINT,
+            added_by BIGINT,
+            created_at BIGINT,
+            UNIQUE(channel_dbid, user_id)
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS submission_actions (
+            id SERIAL PRIMARY KEY,
+            submission_id INTEGER,
+            moderator_id BIGINT,
+            action TEXT,
+            note TEXT,
+            created_at BIGINT
+        );
+        ''')
+        db.commit()
 
-# channels: owner_id — тот, кто подключил канал
-cur.execute('''
-CREATE TABLE IF NOT EXISTS channels (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_id INTEGER,
-    channel_id TEXT,
-    title TEXT,
-    created_at INTEGER
-)
-''')
+    init_pg_tables()
+else:
+    # SQLite (fallback) — как было раньше
+    db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+    cur = db.cursor()
 
-# гарантируем уникальность channel_id (чтобы не добавлять один и тот же канал несколько раз)
-cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_channel_id ON channels(channel_id)")
+    # channels: owner_id — тот, кто подключил канал
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS channels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER,
+        channel_id TEXT,
+        title TEXT,
+        created_at INTEGER
+    )
+    ''')
 
-# channel_admins: модераторы канала (owner может добавить нескольких)
-cur.execute('''
-CREATE TABLE IF NOT EXISTS channel_admins (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_dbid INTEGER,
-    admin_user_id INTEGER,
-    added_by INTEGER,
-    created_at INTEGER,
-    UNIQUE(channel_dbid, admin_user_id)
-)
-''')
+    # гарантируем уникальность channel_id (чтобы не добавлять один и тот же канал несколько раз)
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_channel_id ON channels(channel_id)")
 
-# submissions: заявки от пользователей
-cur.execute('''
-CREATE TABLE IF NOT EXISTS submissions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    content_type TEXT,
-    text_content TEXT,
-    file_id TEXT,
-    status TEXT,
-    created_at INTEGER,
-    anonymous INTEGER DEFAULT 1,
-    target_channel_dbid INTEGER DEFAULT 0
-)
-''')
+    # channel_admins: модераторы канала (owner может добавить нескольких)
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS channel_admins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_dbid INTEGER,
+        admin_user_id INTEGER,
+        added_by INTEGER,
+        created_at INTEGER,
+        UNIQUE(channel_dbid, admin_user_id)
+    )
+    ''')
 
-# cooldowns: когда пользователь в последний раз успешно публиковал в канал
-cur.execute('''
-CREATE TABLE IF NOT EXISTS cooldowns (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    channel_dbid INTEGER,
-    last_ts INTEGER,
-    UNIQUE(user_id, channel_dbid)
-)
-''')
+    # submissions: заявки от пользователей
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS submissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        content_type TEXT,
+        text_content TEXT,
+        file_id TEXT,
+        status TEXT,
+        created_at INTEGER,
+        anonymous INTEGER DEFAULT 1,
+        target_channel_dbid INTEGER DEFAULT 0
+    )
+    ''')
 
-# persistent user states (замена in-memory user_state)
-cur.execute('''
-CREATE TABLE IF NOT EXISTS user_states (
-    user_id INTEGER PRIMARY KEY,
-    state TEXT,
-    updated_at INTEGER
-)
-''')
+    # cooldowns: когда пользователь в последний раз успешно публиковал в канал
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS cooldowns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        channel_dbid INTEGER,
+        last_ts INTEGER,
+        UNIQUE(user_id, channel_dbid)
+    )
+    ''')
 
-# bans: локальные баны по каналу
-cur.execute('''
-CREATE TABLE IF NOT EXISTS bans (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_dbid INTEGER,
-    user_id INTEGER,
-    added_by INTEGER,
-    created_at INTEGER,
-    UNIQUE(channel_dbid, user_id)
-)
-''')
+    # persistent user states (замена in-memory user_state)
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS user_states (
+        user_id INTEGER PRIMARY KEY,
+        state TEXT,
+        updated_at INTEGER
+    )
+    ''')
 
-# submission_actions: лог действий модераторов (accept/reject/publish/reply)
-cur.execute('''
-CREATE TABLE IF NOT EXISTS submission_actions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    submission_id INTEGER,
-    moderator_id INTEGER,
-    action TEXT,
-    note TEXT,
-    created_at INTEGER
-)
-''')
+    # bans: локальные баны по каналу
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS bans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_dbid INTEGER,
+        user_id INTEGER,
+        added_by INTEGER,
+        created_at INTEGER,
+        UNIQUE(channel_dbid, user_id)
+    )
+    ''')
 
-db.commit()
+    # submission_actions: лог действий модераторов (accept/reject/publish/reply)
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS submission_actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        submission_id INTEGER,
+        moderator_id INTEGER,
+        action TEXT,
+        note TEXT,
+        created_at INTEGER
+    )
+    ''')
+
+    db.commit()
 
 # ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def now_ts():
@@ -138,134 +233,243 @@ def now_ts():
 def set_state(user_id, state):
     ts = now_ts()
     try:
-        cur.execute("INSERT OR REPLACE INTO user_states (user_id, state, updated_at) VALUES (?, ?, ?)", (user_id, state, ts))
-        db.commit()
+        if USE_PG:
+            cur.execute("INSERT INTO user_states (user_id, state, updated_at) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state, updated_at = EXCLUDED.updated_at", (user_id, state, ts))
+            db.commit()
+        else:
+            cur.execute("INSERT OR REPLACE INTO user_states (user_id, state, updated_at) VALUES (?, ?, ?)", (user_id, state, ts))
+            db.commit()
     except Exception:
         pass
 
 def get_state(user_id):
-    cur.execute("SELECT state FROM user_states WHERE user_id = ?", (user_id,))
-    r = cur.fetchone()
+    if USE_PG:
+        cur.execute("SELECT state FROM user_states WHERE user_id = %s", (user_id,))
+        r = cur.fetchone()
+    else:
+        cur.execute("SELECT state FROM user_states WHERE user_id = ?", (user_id,))
+        r = cur.fetchone()
     return r[0] if r else None
 
 def pop_state(user_id):
-    cur.execute("SELECT state FROM user_states WHERE user_id = ?", (user_id,))
-    r = cur.fetchone()
-    if not r:
-        return None
-    state = r[0]
-    cur.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
-    db.commit()
-    return state
+    if USE_PG:
+        cur.execute("SELECT state FROM user_states WHERE user_id = %s", (user_id,))
+        r = cur.fetchone()
+        if not r:
+            return None
+        state = r[0]
+        cur.execute("DELETE FROM user_states WHERE user_id = %s", (user_id,))
+        db.commit()
+        return state
+    else:
+        cur.execute("SELECT state FROM user_states WHERE user_id = ?", (user_id,))
+        r = cur.fetchone()
+        if not r:
+            return None
+        state = r[0]
+        cur.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
+        db.commit()
+        return state
 
 # channels
 def add_channel(owner_id, channel_id, title):
     ts = now_ts()
     key = str(channel_id)
     # проверка существующего канала (защита от дублирования)
-    cur.execute("SELECT id FROM channels WHERE channel_id = ?", (key,))
-    existing = cur.fetchone()
-    if existing:
-        return existing[0]
-    try:
-        cur.execute("INSERT INTO channels (owner_id, channel_id, title, created_at) VALUES (?, ?, ?, ?)", (owner_id, key, title, ts))
-        db.commit()
-        return cur.lastrowid
-    except sqlite3.IntegrityError:
-        # если уникальность нарушена параллельно — вернём существующий id
+    if USE_PG:
+        cur.execute("SELECT id FROM channels WHERE channel_id = %s", (key,))
+        existing = cur.fetchone()
+        if existing:
+            return existing[0]
+        try:
+            cur.execute("INSERT INTO channels (owner_id, channel_id, title, created_at) VALUES (%s, %s, %s, %s) RETURNING id", (owner_id, key, title, ts))
+            new_id = cur.fetchone()[0]
+            db.commit()
+            return new_id
+        except psycopg2.IntegrityError:
+            cur.execute("SELECT id FROM channels WHERE channel_id = %s", (key,))
+            r = cur.fetchone()
+            return r[0] if r else None
+        except Exception:
+            return None
+    else:
         cur.execute("SELECT id FROM channels WHERE channel_id = ?", (key,))
-        r = cur.fetchone()
-        return r[0] if r else None
-    except Exception:
-        return None
+        existing = cur.fetchone()
+        if existing:
+            return existing[0]
+        try:
+            cur.execute("INSERT INTO channels (owner_id, channel_id, title, created_at) VALUES (?, ?, ?, ?)", (owner_id, key, title, ts))
+            db.commit()
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            cur.execute("SELECT id FROM channels WHERE channel_id = ?", (key,))
+            r = cur.fetchone()
+            return r[0] if r else None
+        except Exception:
+            return None
 
 def list_channels_by_owner(owner_id):
-    cur.execute("SELECT id, channel_id, title FROM channels WHERE owner_id = ? ORDER BY created_at DESC", (owner_id,))
-    return cur.fetchall()
+    if USE_PG:
+        cur.execute("SELECT id, channel_id, title FROM channels WHERE owner_id = %s ORDER BY created_at DESC", (owner_id,))
+        return cur.fetchall()
+    else:
+        cur.execute("SELECT id, channel_id, title FROM channels WHERE owner_id = ? ORDER BY created_at DESC", (owner_id,))
+        return cur.fetchall()
 
 def get_channel_by_dbid(dbid):
-    cur.execute("SELECT id, owner_id, channel_id, title FROM channels WHERE id = ?", (dbid,))
-    return cur.fetchone()
+    if USE_PG:
+        cur.execute("SELECT id, owner_id, channel_id, title FROM channels WHERE id = %s", (dbid,))
+        return cur.fetchone()
+    else:
+        cur.execute("SELECT id, owner_id, channel_id, title FROM channels WHERE id = ?", (dbid,))
+        return cur.fetchone()
 
 def remove_channel(dbid):
-    cur.execute("DELETE FROM channels WHERE id = ?", (dbid,))
-    cur.execute("DELETE FROM channel_admins WHERE channel_dbid = ?", (dbid,))
-    cur.execute("DELETE FROM bans WHERE channel_dbid = ?", (dbid,))
-    db.commit()
+    if USE_PG:
+        cur.execute("DELETE FROM channels WHERE id = %s", (dbid,))
+        cur.execute("DELETE FROM channel_admins WHERE channel_dbid = %s", (dbid,))
+        cur.execute("DELETE FROM bans WHERE channel_dbid = %s", (dbid,))
+        db.commit()
+    else:
+        cur.execute("DELETE FROM channels WHERE id = ?", (dbid,))
+        cur.execute("DELETE FROM channel_admins WHERE channel_dbid = ?", (dbid,))
+        cur.execute("DELETE FROM bans WHERE channel_dbid = ?", (dbid,))
+        db.commit()
 
 # channel admins
 def add_channel_admin(channel_dbid, admin_user_id, added_by):
     ts = now_ts()
-    try:
-        cur.execute("INSERT INTO channel_admins (channel_dbid, admin_user_id, added_by, created_at) VALUES (?, ?, ?, ?)",
-                    (channel_dbid, admin_user_id, added_by, ts))
-        db.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
+    if USE_PG:
+        try:
+            cur.execute("INSERT INTO channel_admins (channel_dbid, admin_user_id, added_by, created_at) VALUES (%s, %s, %s, %s)", (channel_dbid, admin_user_id, added_by, ts))
+            db.commit()
+            return True
+        except psycopg2.IntegrityError:
+            return False
+        except Exception:
+            return False
+    else:
+        try:
+            cur.execute("INSERT INTO channel_admins (channel_dbid, admin_user_id, added_by, created_at) VALUES (?, ?, ?, ?)", (channel_dbid, admin_user_id, added_by, ts))
+            db.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
 def list_channel_admins(channel_dbid):
-    cur.execute("SELECT admin_user_id FROM channel_admins WHERE channel_dbid = ?", (channel_dbid,))
-    return [r[0] for r in cur.fetchall()]
+    if USE_PG:
+        cur.execute("SELECT admin_user_id FROM channel_admins WHERE channel_dbid = %s", (channel_dbid,))
+        return [r[0] for r in cur.fetchall()]
+    else:
+        cur.execute("SELECT admin_user_id FROM channel_admins WHERE channel_dbid = ?", (channel_dbid,))
+        return [r[0] for r in cur.fetchall()]
 
 def remove_channel_admin(channel_dbid, admin_user_id):
-    cur.execute("DELETE FROM channel_admins WHERE channel_dbid = ? AND admin_user_id = ?", (channel_dbid, admin_user_id))
-    db.commit()
+    if USE_PG:
+        cur.execute("DELETE FROM channel_admins WHERE channel_dbid = %s AND admin_user_id = %s", (channel_dbid, admin_user_id))
+        db.commit()
+    else:
+        cur.execute("DELETE FROM channel_admins WHERE channel_dbid = ? AND admin_user_id = ?", (channel_dbid, admin_user_id))
+        db.commit()
 
 # submissions
 def save_submission(user_id, content_type, text_content, file_id, anonymous, target_channel_dbid=0):
     ts = now_ts()
-    cur.execute("INSERT INTO submissions (user_id, content_type, text_content, file_id, status, created_at, anonymous, target_channel_dbid) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (user_id, content_type, text_content, file_id, "pending", ts, 1 if anonymous else 0, target_channel_dbid))
-    db.commit()
-    return cur.lastrowid
+    if USE_PG:
+        cur.execute("INSERT INTO submissions (user_id, content_type, text_content, file_id, status, created_at, anonymous, target_channel_dbid) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id", (user_id, content_type, text_content, file_id, "pending", ts, 1 if anonymous else 0, target_channel_dbid))
+        new_id = cur.fetchone()[0]
+        db.commit()
+        return new_id
+    else:
+        cur.execute("INSERT INTO submissions (user_id, content_type, text_content, file_id, status, created_at, anonymous, target_channel_dbid) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (user_id, content_type, text_content, file_id, "pending", ts, 1 if anonymous else 0, target_channel_dbid))
+        db.commit()
+        return cur.lastrowid
 
 def get_submission(sub_id):
-    cur.execute("SELECT id, user_id, content_type, text_content, file_id, status, created_at, anonymous, target_channel_dbid FROM submissions WHERE id = ?", (sub_id,))
-    return cur.fetchone()
+    if USE_PG:
+        cur.execute("SELECT id, user_id, content_type, text_content, file_id, status, created_at, anonymous, target_channel_dbid FROM submissions WHERE id = %s", (sub_id,))
+        return cur.fetchone()
+    else:
+        cur.execute("SELECT id, user_id, content_type, text_content, file_id, status, created_at, anonymous, target_channel_dbid FROM submissions WHERE id = ?", (sub_id,))
+        return cur.fetchone()
 
 def set_submission_status(sub_id, status, moderator_id=None, note=None):
     ts = now_ts()
-    cur.execute("UPDATE submissions SET status = ? WHERE id = ?", (status, sub_id))
-    if moderator_id:
-        try:
-            cur.execute("INSERT INTO submission_actions (submission_id, moderator_id, action, note, created_at) VALUES (?, ?, ?, ?, ?)",
-                        (sub_id, moderator_id, status, note or "", ts))
-        except Exception:
-            pass
-    db.commit()
+    if USE_PG:
+        cur.execute("UPDATE submissions SET status = %s WHERE id = %s", (status, sub_id))
+        if moderator_id:
+            try:
+                cur.execute("INSERT INTO submission_actions (submission_id, moderator_id, action, note, created_at) VALUES (%s, %s, %s, %s, %s)", (sub_id, moderator_id, status, note or "", ts))
+            except Exception:
+                pass
+        db.commit()
+    else:
+        cur.execute("UPDATE submissions SET status = ? WHERE id = ?", (status, sub_id))
+        if moderator_id:
+            try:
+                cur.execute("INSERT INTO submission_actions (submission_id, moderator_id, action, note, created_at) VALUES (?, ?, ?, ?, ?)", (sub_id, moderator_id, status, note or "", ts))
+            except Exception:
+                pass
+        db.commit()
 
 # cooldowns
 def set_cooldown(user_id, channel_dbid, ts=None):
     ts = ts or now_ts()
-    try:
-        cur.execute("INSERT INTO cooldowns (user_id, channel_dbid, last_ts) VALUES (?, ?, ?)", (user_id, channel_dbid, ts))
-    except Exception:
-        cur.execute("UPDATE cooldowns SET last_ts = ? WHERE user_id = ? AND channel_dbid = ?", (ts, user_id, channel_dbid))
-    db.commit()
+    if USE_PG:
+        try:
+            cur.execute("INSERT INTO cooldowns (user_id, channel_dbid, last_ts) VALUES (%s, %s, %s)", (user_id, channel_dbid, ts))
+        except psycopg2.IntegrityError:
+            cur.execute("UPDATE cooldowns SET last_ts = %s WHERE user_id = %s AND channel_dbid = %s", (ts, user_id, channel_dbid))
+        db.commit()
+    else:
+        try:
+            cur.execute("INSERT INTO cooldowns (user_id, channel_dbid, last_ts) VALUES (?, ?, ?)", (user_id, channel_dbid, ts))
+        except Exception:
+            cur.execute("UPDATE cooldowns SET last_ts = ? WHERE user_id = ? AND channel_dbid = ?", (ts, user_id, channel_dbid))
+        db.commit()
 
 def get_last_published(user_id, channel_dbid):
-    cur.execute("SELECT last_ts FROM cooldowns WHERE user_id = ? AND channel_dbid = ?", (user_id, channel_dbid))
-    r = cur.fetchone()
+    if USE_PG:
+        cur.execute("SELECT last_ts FROM cooldowns WHERE user_id = %s AND channel_dbid = %s", (user_id, channel_dbid))
+        r = cur.fetchone()
+    else:
+        cur.execute("SELECT last_ts FROM cooldowns WHERE user_id = ? AND channel_dbid = ?", (user_id, channel_dbid))
+        r = cur.fetchone()
     return r[0] if r else None
 
 # bans
 def add_ban(channel_dbid, user_id, added_by):
     ts = now_ts()
-    try:
-        cur.execute("INSERT INTO bans (channel_dbid, user_id, added_by, created_at) VALUES (?, ?, ?, ?)", (channel_dbid, user_id, added_by, ts))
-        db.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
+    if USE_PG:
+        try:
+            cur.execute("INSERT INTO bans (channel_dbid, user_id, added_by, created_at) VALUES (%s, %s, %s, %s)", (channel_dbid, user_id, added_by, ts))
+            db.commit()
+            return True
+        except psycopg2.IntegrityError:
+            return False
+    else:
+        try:
+            cur.execute("INSERT INTO bans (channel_dbid, user_id, added_by, created_at) VALUES (?, ?, ?, ?)", (channel_dbid, user_id, added_by, ts))
+            db.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
 def remove_ban(channel_dbid, user_id):
-    cur.execute("DELETE FROM bans WHERE channel_dbid = ? AND user_id = ?", (channel_dbid, user_id))
-    db.commit()
+    if USE_PG:
+        cur.execute("DELETE FROM bans WHERE channel_dbid = %s AND user_id = %s", (channel_dbid, user_id))
+        db.commit()
+    else:
+        cur.execute("DELETE FROM bans WHERE channel_dbid = ? AND user_id = ?", (channel_dbid, user_id))
+        db.commit()
 
 def is_banned(channel_dbid, user_id):
-    cur.execute("SELECT 1 FROM bans WHERE channel_dbid = ? AND user_id = ?", (channel_dbid, user_id))
-    return bool(cur.fetchone())
+    if USE_PG:
+        cur.execute("SELECT 1 FROM bans WHERE channel_dbid = %s AND user_id = %s", (channel_dbid, user_id))
+        return bool(cur.fetchone())
+    else:
+        cur.execute("SELECT 1 FROM bans WHERE channel_dbid = ? AND user_id = ?", (channel_dbid, user_id))
+        return bool(cur.fetchone())
 
 # formatting
 def format_timedelta_seconds(sec):
@@ -432,7 +636,10 @@ def handle_channel_forward(m):
     candidate_keys = {channel_key, channel_key.lstrip("@"), str(channel_id)}
     found = None
     for k in candidate_keys:
-        cur.execute("SELECT id FROM channels WHERE channel_id = ?", (k,))
+        if USE_PG:
+            cur.execute("SELECT id FROM channels WHERE channel_id = %s", (k,))
+        else:
+            cur.execute("SELECT id FROM channels WHERE channel_id = ?", (k,))
         r = cur.fetchone()
         if r:
             found = r[0]
@@ -467,7 +674,7 @@ def handle_channel_forward(m):
 @bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("set_mods_"))
 def cq_set_mods(cq):
     bot.answer_callback_query(cq.id)
-    parts = cq.data.split(":")
+    parts = cq.data.split(":" )
     if len(parts) != 2:
         bot.send_message(cq.from_user.id, "Ошибка.")
         return
@@ -605,7 +812,7 @@ def cq_addmod(cq):
 def handle_add_mod(m):
     state = pop_state(m.from_user.id)
     if not state:
-        bot.send_message(m.chat.id, "Сначала выбери «Добавить модератора» в меню канала.")
+        bot.send_message(m.chat.id, "Сначала выберите «Добавить модератора» в меню канала.")
         return
     dbid = int(state.split(":",1)[1])
     admin_candidate = None
@@ -698,7 +905,10 @@ def handle_channel_by_username(m):
     # Попытка 1: прямой поиск в БД по candidate_keys
     row = None
     for k in list(candidate_keys):
-        cur.execute("SELECT id, title, channel_id FROM channels WHERE channel_id = ?", (k,))
+        if USE_PG:
+            cur.execute("SELECT id, title, channel_id FROM channels WHERE channel_id = %s", (k,))
+        else:
+            cur.execute("SELECT id, title, channel_id FROM channels WHERE channel_id = ?", (k,))
         r = cur.fetchone()
         if r:
             row = r
@@ -740,7 +950,10 @@ def handle_channel_by_username(m):
 
             # поиск в БД по всем возможным вариантам
             for k in possible:
-                cur.execute("SELECT id, title, channel_id FROM channels WHERE channel_id = ?", (k,))
+                if USE_PG:
+                    cur.execute("SELECT id, title, channel_id FROM channels WHERE channel_id = %s", (k,))
+                else:
+                    cur.execute("SELECT id, title, channel_id FROM channels WHERE channel_id = ?", (k,))
                 r = cur.fetchone()
                 if r:
                     row = r
@@ -764,7 +977,7 @@ def handle_channel_by_username(m):
 def cq_deeplink_offer(cq):
     bot.answer_callback_query(cq.id)
     try:
-        _, anon_str, dbid_str = cq.data.split(":",2)
+        _, anon_str, dbid_str = cq.data.split(":" ,2)
         anon_flag = True if anon_str == "1" else False
         dbid = int(dbid_str)
     except:
@@ -862,13 +1075,13 @@ def handle_submission(message, anonymous=True, target_dbid=0):
             if anonymous:
                 note = f"Заявка #{sub_id} — анонимно"
                 if content_type == 'text':
-                    bot.send_message(r, f"{note}\n\n{text_content or ''}")
+                    bot.send_message(r, f"{note}\n\n{(text_content or '')}")
                 elif content_type == 'photo':
-                    bot.send_photo(r, file_id, caption=f"{note}\n\n{text_content or ''}")
+                    bot.send_photo(r, file_id, caption=f"{note}\n\n{(text_content or '')}")
                 elif content_type == 'video':
-                    bot.send_video(r, file_id, caption=f"{note}\n\n{text_content or ''}")
+                    bot.send_video(r, file_id, caption=f"{note}\n\n{(text_content or '')}")
                 elif content_type == 'document':
-                    bot.send_document(r, file_id, caption=f"{note}\n\n{text_content or ''}")
+                    bot.send_document(r, file_id, caption=f"{note}\n\n{(text_content or '')}")
             else:
                 bot.forward_message(r, uid, message.message_id)
         except Exception:
@@ -996,8 +1209,12 @@ def send_reply_to_author(message, sub_id):
         bot.send_message(message.from_user.id, "Ответ отправлен.")
         # логируем действие reply
         try:
-            cur.execute("INSERT INTO submission_actions (submission_id, moderator_id, action, note, created_at) VALUES (?, ?, ?, ?, ?)", (sub_id, message.from_user.id, 'reply', message.text or '', now_ts()))
-            db.commit()
+            if USE_PG:
+                cur.execute("INSERT INTO submission_actions (submission_id, moderator_id, action, note, created_at) VALUES (%s, %s, %s, %s, %s)", (sub_id, message.from_user.id, 'reply', message.text or '', now_ts()))
+                db.commit()
+            else:
+                cur.execute("INSERT INTO submission_actions (submission_id, moderator_id, action, note, created_at) VALUES (?, ?, ?, ?, ?)", (sub_id, message.from_user.id, 'reply', message.text or '', now_ts()))
+                db.commit()
         except Exception:
             pass
     except Exception:
@@ -1130,16 +1347,22 @@ def handle_private_default(m):
 def cmd_pending(message):
     uid = message.from_user.id
     # найдем все каналы, где пользователь модератор или владелец
-    cur.execute("SELECT channel_dbid FROM channel_admins WHERE admin_user_id = ?", (uid,))
-    admin_rows = [r[0] for r in cur.fetchall()]
-    cur.execute("SELECT id FROM channels WHERE owner_id = ?", (uid,))
-    owner_rows = [r[0] for r in cur.fetchall()]
+    if USE_PG:
+        cur.execute("SELECT channel_dbid FROM channel_admins WHERE admin_user_id = %s", (uid,))
+        admin_rows = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT id FROM channels WHERE owner_id = %s", (uid,))
+        owner_rows = [r[0] for r in cur.fetchall()]
+    else:
+        cur.execute("SELECT channel_dbid FROM channel_admins WHERE admin_user_id = ?", (uid,))
+        admin_rows = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT id FROM channels WHERE owner_id = ?", (uid,))
+        owner_rows = [r[0] for r in cur.fetchall()]
     watch_dbids = set(admin_rows + owner_rows)
     if not watch_dbids:
         bot.send_message(uid, "Вы не модератор и не владелец ни одного канала.")
         return
     # получить pending заявки для этих каналов
-    placeholders = ','.join('?' for _ in watch_dbids)
+    placeholders = ','.join('%s' for _ in watch_dbids) if USE_PG else ','.join('?' for _ in watch_dbids)
     query = f"SELECT id, user_id, content_type, text_content, file_id, created_at, anonymous, target_channel_dbid FROM submissions WHERE status = 'pending' AND target_channel_dbid IN ({placeholders}) ORDER BY created_at DESC"
     cur.execute(query, tuple(watch_dbids))
     rows = cur.fetchall()
