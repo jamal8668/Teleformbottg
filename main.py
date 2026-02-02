@@ -1575,3 +1575,104 @@ if types is not None and globals().get("bot") is not None:
 # вставьте в место кода, где вы отправляете сообщение с предложением вызов:
 #     attach_admin_buttons_to_message(chat_id, message_id, proposal_id, bot)
 # ------------------ END ADMIN BUTTONS ------------------
+
+
+# ------------------ USER COOLDOWN (added) ------------------
+# Ограничение: 1 сообщение (предложение) в час для каждого пользователя.
+# Чтобы включить стикеры украшения — заполните список STICKER_IDS с file_id стикеров Telegram.
+# Пример: STICKER_IDS = ["CAACAgIAAxkBAAEB..."]
+
+from time import time as _time
+import random as _random
+
+COOLDOWN_SECONDS = 3600  # 1 час
+STICKER_IDS = []  # <- при желании: вставьте сюда file_id стикеров для отправки при предупреждении
+
+# В памяти: user_id -> expiry_timestamp (unix seconds)
+_user_cooldowns = {}
+
+def _format_seconds_ru(seconds: int) -> str:
+    """Форматирует секунды в 'X часов Y минут Z секунд' на русском, убирая нулевые части."""
+    parts = []
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    if hours:
+        # Простая корректная русская форма для часов
+        if 11 <= hours % 100 <= 14:
+            hours_word = "часов"
+        elif hours % 10 == 1:
+            hours_word = "час"
+        elif 2 <= hours % 10 <= 4:
+            hours_word = "часа"
+        else:
+            hours_word = "часов"
+        parts.append(f"{hours} {hours_word}")
+    if minutes:
+        if 11 <= minutes % 100 <= 14:
+            minutes_word = "минут"
+        elif minutes % 10 == 1:
+            minutes_word = "минута"
+        elif 2 <= minutes % 10 <= 4:
+            minutes_word = "минуты"
+        else:
+            minutes_word = "минут"
+        parts.append(f"{minutes} {minutes_word}")
+    if secs or not parts:
+        if 11 <= secs % 100 <= 14:
+            secs_word = "секунд"
+        elif secs % 10 == 1:
+            secs_word = "секунда"
+        elif 2 <= secs % 10 <= 4:
+            secs_word = "секунды"
+        else:
+            secs_word = "секунд"
+        parts.append(f"{secs} {secs_word}")
+    return " ".join(parts)
+
+def enforce_user_cooldown(chat_id: int, user_id: int, bot_instance=None) -> bool:
+    """
+    Проверяет и устанавливает кд для пользователя.
+    Если пользователь ещё в кд — отправляет уведомление в чат (и стикер, если задан) с оставшимся временем
+    и возвращает False.
+    Если кд отсутствует — устанавливает новый (на COOLDOWN_SECONDS) и возвращает True.
+    Использование: вызвать перед созданием/приёмом нового предложения:
+        if not enforce_user_cooldown(chat_id, user_id, bot): return
+    """
+    b = bot_instance if bot_instance is not None else globals().get("bot")
+    now = int(_time())
+    expiry = _user_cooldowns.get(user_id, 0)
+    if expiry > now:
+        remaining = int(expiry - now)
+        remaining_text = _format_seconds_ru(remaining)
+        try:
+            # Отправляем стикер (если указаны)
+            if STICKER_IDS and b is not None and hasattr(b, "send_sticker"):
+                try:
+                    _st = _random.choice(STICKER_IDS)
+                    b.send_sticker(chat_id, _st)
+                except Exception:
+                    pass
+            # Отправляем текстовое уведомление с оставшимся временем
+            if b is not None and hasattr(b, "send_message"):
+                b.send_message(chat_id, f"⏱️ Вы должны подождать {remaining_text} прежде чем отправить ещё посты.\nОсталось: {remaining_text}")
+        except Exception:
+            # если отправка в чат не удалась — пробуем отправить личное сообщение пользователю
+            try:
+                if b is not None and hasattr(b, "send_message"):
+                    b.send_message(user_id, f"⏱️ Вы должны подождать {remaining_text} прежде чем отправить ещё посты.\nОсталось: {remaining_text}")
+            except Exception:
+                pass
+        return False
+    else:
+        # Устанавливаем новое время истечения
+        _user_cooldowns[user_id] = now + COOLDOWN_SECONDS
+        # дополнительно можно отправить лёгкую реакцию или стикер подтверждения, но обычно не нужно
+        return True
+
+# Примечание: это in-memory кд. При перезапуске бота все кд сбросятся.
+# Если нужна постоянность — необходимо сохранить _user_cooldowns в БД или в файл.
+# Для интеграции: найдите место в вашем коде, где пользователь отправляет "предложение"
+# и добавьте проверку:
+#     if not enforce_user_cooldown(chat_id, message.from_user.id, bot): return
+# ------------------ END USER COOLDOWN ------------------
