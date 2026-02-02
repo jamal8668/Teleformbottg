@@ -1,246 +1,487 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Телеграм-бот (один файл).
-Изменения: реализован COOLDOWN 1 час при отправке заявки (сохранение в БД).
-Сохранение кд в таблице cooldowns — кд не теряется при перезапуске.
-
-Установка зависимостей:
-pip install pyTelegramBotAPI Flask psycopg2-binary
-(если не используете Postgres, достаточно sqlite3 который в stdlib)
-
-Настройка:
-- Замените TOKEN на токен бота.
-- При желании измените COOLDOWN_SECONDS (по умолчанию 3600 — 1 час).
-"""
+# main.py
+# Teleform — исправленная версия без функции "обычная заявка" (только через подключённые каналы)
+# Добавлен webhook (Flask). Токен берётся из переменных окружения или из заданного по умолчанию.
+# Поддержка: PostgreSQL (через env DATABASE_URL). Если DATABASE_URL не задан — fallback на SQLite.
+# Требует: pip install pyTelegramBotAPI Flask gunicorn psycopg2-binary
 
 import os
 import time
 import logging
-import sqlite3
 from datetime import timedelta
 from flask import Flask, request, abort
+
+# DB drivers (Postgres optional)
+DATABASE_URL = os.environ.get("DATABASE_URL")
+USE_PG = bool(DATABASE_URL)
+
+if USE_PG:
+    import psycopg2
+    # connect to Postgres
+    try:
+        pg_conn = psycopg2.connect(DATABASE_URL)
+        db = pg_conn
+        cur = db.cursor()
+        logger = logging.getLogger(__name__)
+        logger.info("Using PostgreSQL database")
+    except Exception as e:
+        raise RuntimeError(f"Не удалось подключиться к Postgres: {e}")
+else:
+    import sqlite3
 
 import telebot
 from telebot import types
 
-# --------------- CONFIG ----------------
-TOKEN = os.environ.get("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
-WEBHOOK_BASE = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL", "https://your-service.onrender.com")
-PORT = int(os.environ.get("PORT", 5000))
-COOLDOWN_SECONDS = 3600  # 1 час (измените при необходимости)
-MAX_TEXT_LENGTH = 4000
-MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
-DB_PATH = os.environ.get("DB_PATH", "teleform_cd.db")
-# ---------------------------------------
-
+# ========== ЛОГИРОВАНИЕ ==========
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ========== DATABASE (SQLite fallback) ==========
-# Структура таблиц: channels, channel_admins, submissions, cooldowns, user_states, bans, submission_actions
-db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
-cur = db.cursor()
+# ========== НАСТРОЙКИ (токен из env или значение по умолчанию) ==========
+# Если хочешь хранить токен в env — задай BOT_TOKEN в Render. Если нет, будет использован токен ниже.
+TOKEN = os.environ.get("BOT_TOKEN", "8419255009:AAES3WkfbLW9Gd1JrZiN8x5hQHFGA0EaRD0")
+# Укажи публичный URL вашего сервиса (Render) в WEBHOOK_URL env, например https://your-service.onrender.com
+# Если WEBHOOK_URL не задан, используем переменную RENDER_EXTERNAL_URL (Render автоматически её выставляет).
+WEBHOOK_BASE = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL", "https://your-service.onrender.com")
+PORT = int(os.environ.get("PORT", 5000))
 
-# Create tables if not exist (idempotent)
-cur.execute('''
-CREATE TABLE IF NOT EXISTS channels (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    owner_id INTEGER,
-    channel_id TEXT UNIQUE,
-    title TEXT,
-    created_at INTEGER
-)
-''')
-cur.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_channel_id ON channels(channel_id)')
+COOLDOWN_SECONDS = 3600  # 1 час per-channel
+MAX_TEXT_LENGTH = 4000  # допустимая длина текста
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
+DB_PATH = "teleform_full_v2.db"
 
-cur.execute('''
-CREATE TABLE IF NOT EXISTS channel_admins (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_dbid INTEGER,
-    admin_user_id INTEGER,
-    added_by INTEGER,
-    created_at INTEGER,
-    UNIQUE(channel_dbid, admin_user_id)
-)
-''')
-
-cur.execute('''
-CREATE TABLE IF NOT EXISTS submissions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    content_type TEXT,
-    text_content TEXT,
-    file_id TEXT,
-    status TEXT,
-    created_at INTEGER,
-    anonymous INTEGER DEFAULT 1,
-    target_channel_dbid INTEGER DEFAULT 0
-)
-''')
-
-cur.execute('''
-CREATE TABLE IF NOT EXISTS cooldowns (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    channel_dbid INTEGER,
-    last_ts INTEGER,
-    UNIQUE(user_id, channel_dbid)
-)
-''')
-
-cur.execute('''
-CREATE TABLE IF NOT EXISTS user_states (
-    user_id INTEGER PRIMARY KEY,
-    state TEXT,
-    updated_at INTEGER
-)
-''')
-
-cur.execute('''
-CREATE TABLE IF NOT EXISTS bans (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_dbid INTEGER,
-    user_id INTEGER,
-    added_by INTEGER,
-    created_at INTEGER,
-    UNIQUE(channel_dbid, user_id)
-)
-''')
-
-cur.execute('''
-CREATE TABLE IF NOT EXISTS submission_actions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    submission_id INTEGER,
-    moderator_id INTEGER,
-    action TEXT,
-    note TEXT,
-    created_at INTEGER
-)
-''')
-
-db.commit()
-
-# ========== BOT ==========
+# Создаём бота (webhook mode)
 bot = telebot.TeleBot(TOKEN)
+
+# BOT username (для deep links)
 try:
     BOT_USERNAME = bot.get_me().username
 except Exception:
     BOT_USERNAME = None
 
-# ========== HELPERS ==========
+# ========== БД ==========
+if USE_PG:
+    # Создадим таблицы в Postgres (с типами, совместимыми с исходной логикой)
+    def init_pg_tables():
+        # используем BIGINT для id пользователей/каналов и BIGINT created_at (epoch)
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS channels (
+            id SERIAL PRIMARY KEY,
+            owner_id BIGINT,
+            channel_id TEXT UNIQUE,
+            title TEXT,
+            created_at BIGINT
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS channel_admins (
+            id SERIAL PRIMARY KEY,
+            channel_dbid INTEGER,
+            admin_user_id BIGINT,
+            added_by BIGINT,
+            created_at BIGINT,
+            UNIQUE(channel_dbid, admin_user_id)
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS submissions (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            content_type TEXT,
+            text_content TEXT,
+            file_id TEXT,
+            status TEXT,
+            created_at BIGINT,
+            anonymous INTEGER DEFAULT 1,
+            target_channel_dbid INTEGER DEFAULT 0
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS cooldowns (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            channel_dbid INTEGER,
+            last_ts BIGINT,
+            UNIQUE(user_id, channel_dbid)
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS user_states (
+            user_id BIGINT PRIMARY KEY,
+            state TEXT,
+            updated_at BIGINT
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS bans (
+            id SERIAL PRIMARY KEY,
+            channel_dbid INTEGER,
+            user_id BIGINT,
+            added_by BIGINT,
+            created_at BIGINT,
+            UNIQUE(channel_dbid, user_id)
+        );
+        ''')
+        cur.execute('''
+        CREATE TABLE IF NOT EXISTS submission_actions (
+            id SERIAL PRIMARY KEY,
+            submission_id INTEGER,
+            moderator_id BIGINT,
+            action TEXT,
+            note TEXT,
+            created_at BIGINT
+        );
+        ''')
+        db.commit()
+
+    init_pg_tables()
+else:
+    # SQLite (fallback) — как было раньше
+    db = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=30)
+    cur = db.cursor()
+
+    # channels: owner_id — тот, кто подключил канал
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS channels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER,
+        channel_id TEXT,
+        title TEXT,
+        created_at INTEGER
+    )
+    ''')
+
+    # гарантируем уникальность channel_id (чтобы не добавлять один и тот же канал несколько раз)
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_channel_id ON channels(channel_id)")
+
+    # channel_admins: модераторы канала (owner может добавить нескольких)
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS channel_admins (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_dbid INTEGER,
+        admin_user_id INTEGER,
+        added_by INTEGER,
+        created_at INTEGER,
+        UNIQUE(channel_dbid, admin_user_id)
+    )
+    ''')
+
+    # submissions: заявки от пользователей
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS submissions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        content_type TEXT,
+        text_content TEXT,
+        file_id TEXT,
+        status TEXT,
+        created_at INTEGER,
+        anonymous INTEGER DEFAULT 1,
+        target_channel_dbid INTEGER DEFAULT 0
+    )
+    ''')
+
+    # cooldowns: когда пользователь в последний раз успешно публиковал в канал
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS cooldowns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        channel_dbid INTEGER,
+        last_ts INTEGER,
+        UNIQUE(user_id, channel_dbid)
+    )
+    ''')
+
+    # persistent user states (замена in-memory user_state)
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS user_states (
+        user_id INTEGER PRIMARY KEY,
+        state TEXT,
+        updated_at INTEGER
+    )
+    ''')
+
+    # bans: локальные баны по каналу
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS bans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel_dbid INTEGER,
+        user_id INTEGER,
+        added_by INTEGER,
+        created_at INTEGER,
+        UNIQUE(channel_dbid, user_id)
+    )
+    ''')
+
+    # submission_actions: лог действий модераторов (accept/reject/publish/reply)
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS submission_actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        submission_id INTEGER,
+        moderator_id INTEGER,
+        action TEXT,
+        note TEXT,
+        created_at INTEGER
+    )
+    ''')
+
+    db.commit()
+
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def now_ts():
     return int(time.time())
 
+# state persistence
 def set_state(user_id, state):
     ts = now_ts()
-    cur.execute("INSERT OR REPLACE INTO user_states (user_id, state, updated_at) VALUES (?, ?, ?)", (user_id, state, ts))
-    db.commit()
+    try:
+        if USE_PG:
+            cur.execute("INSERT INTO user_states (user_id, state, updated_at) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state, updated_at = EXCLUDED.updated_at", (user_id, state, ts))
+            db.commit()
+        else:
+            cur.execute("INSERT OR REPLACE INTO user_states (user_id, state, updated_at) VALUES (?, ?, ?)", (user_id, state, ts))
+            db.commit()
+    except Exception:
+        pass
 
 def get_state(user_id):
-    cur.execute("SELECT state FROM user_states WHERE user_id = ?", (user_id,))
-    r = cur.fetchone()
+    if USE_PG:
+        cur.execute("SELECT state FROM user_states WHERE user_id = %s", (user_id,))
+        r = cur.fetchone()
+    else:
+        cur.execute("SELECT state FROM user_states WHERE user_id = ?", (user_id,))
+        r = cur.fetchone()
     return r[0] if r else None
 
 def pop_state(user_id):
-    cur.execute("SELECT state FROM user_states WHERE user_id = ?", (user_id,))
-    r = cur.fetchone()
-    if not r:
-        return None
-    state = r[0]
-    cur.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
-    db.commit()
-    return state
+    if USE_PG:
+        cur.execute("SELECT state FROM user_states WHERE user_id = %s", (user_id,))
+        r = cur.fetchone()
+        if not r:
+            return None
+        state = r[0]
+        cur.execute("DELETE FROM user_states WHERE user_id = %s", (user_id,))
+        db.commit()
+        return state
+    else:
+        cur.execute("SELECT state FROM user_states WHERE user_id = ?", (user_id,))
+        r = cur.fetchone()
+        if not r:
+            return None
+        state = r[0]
+        cur.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
+        db.commit()
+        return state
 
 # channels
 def add_channel(owner_id, channel_id, title):
     ts = now_ts()
-    try:
-        cur.execute("INSERT INTO channels (owner_id, channel_id, title, created_at) VALUES (?, ?, ?, ?)", (owner_id, str(channel_id), title, ts))
-        db.commit()
-        return cur.lastrowid
-    except sqlite3.IntegrityError:
-        cur.execute("SELECT id FROM channels WHERE channel_id = ?", (str(channel_id),))
-        r = cur.fetchone()
-        return r[0] if r else None
-    except Exception:
-        return None
+    key = str(channel_id)
+    # проверка существующего канала (защита от дублирования)
+    if USE_PG:
+        cur.execute("SELECT id FROM channels WHERE channel_id = %s", (key,))
+        existing = cur.fetchone()
+        if existing:
+            return existing[0]
+        try:
+            cur.execute("INSERT INTO channels (owner_id, channel_id, title, created_at) VALUES (%s, %s, %s, %s) RETURNING id", (owner_id, key, title, ts))
+            new_id = cur.fetchone()[0]
+            db.commit()
+            return new_id
+        except psycopg2.IntegrityError:
+            cur.execute("SELECT id FROM channels WHERE channel_id = %s", (key,))
+            r = cur.fetchone()
+            return r[0] if r else None
+        except Exception:
+            return None
+    else:
+        cur.execute("SELECT id FROM channels WHERE channel_id = ?", (key,))
+        existing = cur.fetchone()
+        if existing:
+            return existing[0]
+        try:
+            cur.execute("INSERT INTO channels (owner_id, channel_id, title, created_at) VALUES (?, ?, ?, ?)", (owner_id, key, title, ts))
+            db.commit()
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            cur.execute("SELECT id FROM channels WHERE channel_id = ?", (key,))
+            r = cur.fetchone()
+            return r[0] if r else None
+        except Exception:
+            return None
+
+def list_channels_by_owner(owner_id):
+    if USE_PG:
+        cur.execute("SELECT id, channel_id, title FROM channels WHERE owner_id = %s ORDER BY created_at DESC", (owner_id,))
+        return cur.fetchall()
+    else:
+        cur.execute("SELECT id, channel_id, title FROM channels WHERE owner_id = ? ORDER BY created_at DESC", (owner_id,))
+        return cur.fetchall()
 
 def get_channel_by_dbid(dbid):
-    cur.execute("SELECT id, owner_id, channel_id, title FROM channels WHERE id = ?", (dbid,))
-    return cur.fetchone()
+    if USE_PG:
+        cur.execute("SELECT id, owner_id, channel_id, title FROM channels WHERE id = %s", (dbid,))
+        return cur.fetchone()
+    else:
+        cur.execute("SELECT id, owner_id, channel_id, title FROM channels WHERE id = ?", (dbid,))
+        return cur.fetchone()
 
-def list_channel_admins(channel_dbid):
-    cur.execute("SELECT admin_user_id FROM channel_admins WHERE channel_dbid = ?", (channel_dbid,))
-    return [r[0] for r in cur.fetchall()]
+def remove_channel(dbid):
+    if USE_PG:
+        cur.execute("DELETE FROM channels WHERE id = %s", (dbid,))
+        cur.execute("DELETE FROM channel_admins WHERE channel_dbid = %s", (dbid,))
+        cur.execute("DELETE FROM bans WHERE channel_dbid = %s", (dbid,))
+        db.commit()
+    else:
+        cur.execute("DELETE FROM channels WHERE id = ?", (dbid,))
+        cur.execute("DELETE FROM channel_admins WHERE channel_dbid = ?", (dbid,))
+        cur.execute("DELETE FROM bans WHERE channel_dbid = ?", (dbid,))
+        db.commit()
 
+# channel admins
 def add_channel_admin(channel_dbid, admin_user_id, added_by):
     ts = now_ts()
-    try:
-        cur.execute("INSERT INTO channel_admins (channel_dbid, admin_user_id, added_by, created_at) VALUES (?, ?, ?, ?)", (channel_dbid, admin_user_id, added_by, ts))
+    if USE_PG:
+        try:
+            cur.execute("INSERT INTO channel_admins (channel_dbid, admin_user_id, added_by, created_at) VALUES (%s, %s, %s, %s)", (channel_dbid, admin_user_id, added_by, ts))
+            db.commit()
+            return True
+        except psycopg2.IntegrityError:
+            return False
+        except Exception:
+            return False
+    else:
+        try:
+            cur.execute("INSERT INTO channel_admins (channel_dbid, admin_user_id, added_by, created_at) VALUES (?, ?, ?, ?)", (channel_dbid, admin_user_id, added_by, ts))
+            db.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+def list_channel_admins(channel_dbid):
+    if USE_PG:
+        cur.execute("SELECT admin_user_id FROM channel_admins WHERE channel_dbid = %s", (channel_dbid,))
+        return [r[0] for r in cur.fetchall()]
+    else:
+        cur.execute("SELECT admin_user_id FROM channel_admins WHERE channel_dbid = ?", (channel_dbid,))
+        return [r[0] for r in cur.fetchall()]
+
+def remove_channel_admin(channel_dbid, admin_user_id):
+    if USE_PG:
+        cur.execute("DELETE FROM channel_admins WHERE channel_dbid = %s AND admin_user_id = %s", (channel_dbid, admin_user_id))
         db.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
+    else:
+        cur.execute("DELETE FROM channel_admins WHERE channel_dbid = ? AND admin_user_id = ?", (channel_dbid, admin_user_id))
+        db.commit()
 
 # submissions
 def save_submission(user_id, content_type, text_content, file_id, anonymous, target_channel_dbid=0):
     ts = now_ts()
-    cur.execute("INSERT INTO submissions (user_id, content_type, text_content, file_id, status, created_at, anonymous, target_channel_dbid) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (user_id, content_type, text_content, file_id, "pending", ts, 1 if anonymous else 0, target_channel_dbid))
-    db.commit()
-    return cur.lastrowid
+    if USE_PG:
+        cur.execute("INSERT INTO submissions (user_id, content_type, text_content, file_id, status, created_at, anonymous, target_channel_dbid) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id", (user_id, content_type, text_content, file_id, "pending", ts, 1 if anonymous else 0, target_channel_dbid))
+        new_id = cur.fetchone()[0]
+        db.commit()
+        return new_id
+    else:
+        cur.execute("INSERT INTO submissions (user_id, content_type, text_content, file_id, status, created_at, anonymous, target_channel_dbid) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (user_id, content_type, text_content, file_id, "pending", ts, 1 if anonymous else 0, target_channel_dbid))
+        db.commit()
+        return cur.lastrowid
 
 def get_submission(sub_id):
-    cur.execute("SELECT id, user_id, content_type, text_content, file_id, status, created_at, anonymous, target_channel_dbid FROM submissions WHERE id = ?", (sub_id,))
-    return cur.fetchone()
+    if USE_PG:
+        cur.execute("SELECT id, user_id, content_type, text_content, file_id, status, created_at, anonymous, target_channel_dbid FROM submissions WHERE id = %s", (sub_id,))
+        return cur.fetchone()
+    else:
+        cur.execute("SELECT id, user_id, content_type, text_content, file_id, status, created_at, anonymous, target_channel_dbid FROM submissions WHERE id = ?", (sub_id,))
+        return cur.fetchone()
 
 def set_submission_status(sub_id, status, moderator_id=None, note=None):
     ts = now_ts()
-    cur.execute("UPDATE submissions SET status = ? WHERE id = ?", (status, sub_id))
-    if moderator_id:
-        cur.execute("INSERT INTO submission_actions (submission_id, moderator_id, action, note, created_at) VALUES (?, ?, ?, ?, ?)", (sub_id, moderator_id, status, note or "", ts))
-    db.commit()
+    if USE_PG:
+        cur.execute("UPDATE submissions SET status = %s WHERE id = %s", (status, sub_id))
+        if moderator_id:
+            try:
+                cur.execute("INSERT INTO submission_actions (submission_id, moderator_id, action, note, created_at) VALUES (%s, %s, %s, %s, %s)", (sub_id, moderator_id, status, note or "", ts))
+            except Exception:
+                pass
+        db.commit()
+    else:
+        cur.execute("UPDATE submissions SET status = ? WHERE id = ?", (status, sub_id))
+        if moderator_id:
+            try:
+                cur.execute("INSERT INTO submission_actions (submission_id, moderator_id, action, note, created_at) VALUES (?, ?, ?, ?, ?)", (sub_id, moderator_id, action, note or "", ts))
+            except Exception:
+                pass
+        db.commit()
 
-# cooldowns (persistent)
+# cooldowns
 def set_cooldown(user_id, channel_dbid, ts=None):
     ts = ts or now_ts()
-    try:
-        cur.execute("INSERT INTO cooldowns (user_id, channel_dbid, last_ts) VALUES (?, ?, ?)", (user_id, channel_dbid, ts))
-    except sqlite3.IntegrityError:
-        cur.execute("UPDATE cooldowns SET last_ts = ? WHERE user_id = ? AND channel_dbid = ?", (ts, user_id, channel_dbid))
-    db.commit()
+    if USE_PG:
+        try:
+            cur.execute("INSERT INTO cooldowns (user_id, channel_dbid, last_ts) VALUES (%s, %s, %s)", (user_id, channel_dbid, ts))
+        except psycopg2.IntegrityError:
+            cur.execute("UPDATE cooldowns SET last_ts = %s WHERE user_id = %s AND channel_dbid = %s", (ts, user_id, channel_dbid))
+        db.commit()
+    else:
+        try:
+            cur.execute("INSERT INTO cooldowns (user_id, channel_dbid, last_ts) VALUES (?, ?, ?)", (user_id, channel_dbid, ts))
+        except Exception:
+            cur.execute("UPDATE cooldowns SET last_ts = ? WHERE user_id = ? AND channel_dbid = ?", (ts, user_id, channel_dbid))
+        db.commit()
 
 def get_last_published(user_id, channel_dbid):
-    cur.execute("SELECT last_ts FROM cooldowns WHERE user_id = ? AND channel_dbid = ?", (user_id, channel_dbid))
-    r = cur.fetchone()
+    if USE_PG:
+        cur.execute("SELECT last_ts FROM cooldowns WHERE user_id = %s AND channel_dbid = %s", (user_id, channel_dbid))
+        r = cur.fetchone()
+    else:
+        cur.execute("SELECT last_ts FROM cooldowns WHERE user_id = ? AND channel_dbid = ?", (user_id, channel_dbid))
+        r = cur.fetchone()
     return r[0] if r else None
 
 # bans
 def add_ban(channel_dbid, user_id, added_by):
     ts = now_ts()
-    try:
-        cur.execute("INSERT INTO bans (channel_dbid, user_id, added_by, created_at) VALUES (?, ?, ?, ?)", (channel_dbid, user_id, added_by, ts))
+    if USE_PG:
+        try:
+            cur.execute("INSERT INTO bans (channel_dbid, user_id, added_by, created_at) VALUES (%s, %s, %s, %s)", (channel_dbid, user_id, added_by, ts))
+            db.commit()
+            return True
+        except psycopg2.IntegrityError:
+            return False
+    else:
+        try:
+            cur.execute("INSERT INTO bans (channel_dbid, user_id, added_by, created_at) VALUES (?, ?, ?, ?)", (channel_dbid, user_id, added_by, ts))
+            db.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+def remove_ban(channel_dbid, user_id):
+    if USE_PG:
+        cur.execute("DELETE FROM bans WHERE channel_dbid = %s AND user_id = %s", (channel_dbid, user_id))
         db.commit()
-        return True
-    except sqlite3.IntegrityError:
-        return False
+    else:
+        cur.execute("DELETE FROM bans WHERE channel_dbid = ? AND user_id = ?", (channel_dbid, user_id))
+        db.commit()
 
 def is_banned(channel_dbid, user_id):
-    cur.execute("SELECT 1 FROM bans WHERE channel_dbid = ? AND user_id = ?", (channel_dbid, user_id))
-    return bool(cur.fetchone())
+    if USE_PG:
+        cur.execute("SELECT 1 FROM bans WHERE channel_dbid = %s AND user_id = %s", (channel_dbid, user_id))
+        return bool(cur.fetchone())
+    else:
+        cur.execute("SELECT 1 FROM bans WHERE channel_dbid = ? AND user_id = ?", (channel_dbid, user_id))
+        return bool(cur.fetchone())
 
-# utils
+# formatting
 def format_timedelta_seconds(sec):
     if sec <= 0:
-        return "0:00:00"
+        return "0s"
     td = timedelta(seconds=sec)
     hours = td.seconds // 3600 + td.days * 24
     minutes = (td.seconds % 3600) // 60
     seconds = td.seconds % 60
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
-# --------------- MARKUPS ----------------
+# ========== МАРКАПЫ ==========
 def main_menu():
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("📩 Предложить пост", callback_data="menu_offer"))
@@ -255,12 +496,32 @@ def channels_menu():
     kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="menu_back"))
     return kb
 
-# --------------- HANDLERS ----------------
+# ========== START / MENU ==========
 @bot.message_handler(commands=["start"])
 def cmd_start(message):
+    text = message.text or ""
+    parts = text.split()
+    # manage deep link: "/start post_<dbid>"
+    if len(parts) > 1 and parts[1].startswith("post_"):
+        try:
+            dbid = int(parts[1].split("_",1)[1])
+        except:
+            bot.send_message(message.chat.id, "Неверная ссылка.", reply_markup=main_menu())
+            return
+        ch = get_channel_by_dbid(dbid)
+        if not ch:
+            bot.send_message(message.chat.id, "Канал не найден или удалён.", reply_markup=main_menu())
+            return
+        # offer via deep link: ask anon choice, check cooldown
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("Анонимно", callback_data=f"deep_offer_anon:1:{dbid}"),
+               types.InlineKeyboardButton("Не анонимно", callback_data=f"deep_offer_anon:0:{dbid}"))
+        bot.send_message(message.chat.id, f"📣 Вы хотите отправить пост в канал *{ch[3] or ch[2]}*? Выберите режим отправки:", parse_mode="Markdown", reply_markup=kb)
+        return
+
     pop_state(message.from_user.id)
     bot.send_message(message.chat.id,
-                     "Добро пожаловать! Отправляйте предложения через меню.\n\nКД: 1 сообщение в час для одного канала.",
+                     "Добро пожаловать в Телеформ!\n\nПодключи свой канал, чтобы подписчики могли предлагать посты.👋",
                      reply_markup=main_menu())
 
 @bot.message_handler(commands=["menu"])
@@ -268,6 +529,7 @@ def cmd_menu(message):
     pop_state(message.from_user.id)
     bot.send_message(message.chat.id, "Меню:", reply_markup=main_menu())
 
+# ========== MENU HANDLERS ==========
 @bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("menu_"))
 def cq_menu(cq):
     bot.answer_callback_query(cq.id)
@@ -281,11 +543,16 @@ def cq_menu(cq):
     elif action == "channels":
         show_channels_menu(cq.from_user.id)
     elif action == "help":
+        # разделённая справка: отправка поста и подключение бота
         kb = types.InlineKeyboardMarkup()
         kb.add(types.InlineKeyboardButton("✉️ Как отправить пост", callback_data="help_send"))
         kb.add(types.InlineKeyboardButton("🔌 Как подключить бота", callback_data="help_connect"))
         kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="menu_back"))
-        bot.send_message(cq.from_user.id, "Выберите тему помощи:", reply_markup=kb)
+        bot.send_message(cq.from_user.id,
+                         "Выберите тему помощи:",
+                         reply_markup=kb)
+    elif action == "back":
+        bot.send_message(cq.from_user.id, "Возврат в меню.", reply_markup=main_menu())
     else:
         bot.send_message(cq.from_user.id, "Неизвестное действие.", reply_markup=main_menu())
 
@@ -294,14 +561,17 @@ def cq_menu_back(cq):
     bot.answer_callback_query(cq.id)
     bot.send_message(cq.from_user.id, "Возврат в меню.", reply_markup=main_menu())
 
+# ========== HELP CALLBACKS ==========
 @bot.callback_query_handler(func=lambda cq: cq.data == "help_send")
 def cq_help_send(cq):
     bot.answer_callback_query(cq.id)
     text = (
-        "✉️ Как отправить пост:\n\n"
-        "1) Через кнопку в канале (owner подключает канал)\n"
-        "2) Через меню бота: Предложить пост → указать канал по @username или по deep link\n\n"
-        f"Ограничение по частоте: одна публикация/отправка заявки для одного канала — каждые {COOLDOWN_SECONDS//3600} ч."
+        f"✉️ Как отправить пост через Телеформ:\n\n"
+        f"1) Через кнопку в канале: владелец канала может отправить сообщение с кнопкой «Предложить пост» — подписчики нажимают и выбирают анонимно/не анонимно.\n\n"
+        f"2) Через меню бота: /start → Предложить пост → по @username или ссылке канала.\n\n"
+        f"Что можно отправлять: текст (до {MAX_TEXT_LENGTH} символов), фото, видео, документы (макс размер {MAX_FILE_SIZE // (1024*1024)} MB).\n\n"
+        f"Важно: действует ограничение по частоте — одна публикация в канал каждые {COOLDOWN_SECONDS//3600} ч. (персональный cooldown).\n\n"
+        f"Если заявка отправлена — она попадёт модераторам канала для принятия/отклонения."
     )
     bot.send_message(cq.from_user.id, text)
 
@@ -309,13 +579,18 @@ def cq_help_send(cq):
 def cq_help_connect(cq):
     bot.answer_callback_query(cq.id)
     text = (
-        "🔌 Как подключить бота к каналу:\n\n"
-        "1) Добавьте бота в канал\n"
-        "2) Сделайте бота админом (права на отправку сообщений)\n"
-        "3) В личном чате с ботом → Управление каналами → Подключить канал (перешлите любое сообщение из канала)"
+        "🔌 Как подключить бота к каналу — шаги и права:\n\n"
+        "1) Добавьте бота в канал как участника.\n"
+        "2) Сделайте бота администратором канала (это нужно для публикации сообщений от бота).\n"
+        "   Рекомендуемые права: отправлять сообщения, прикреплять медиа/документы. Необязательно: редактировать сообщения.\n\n"
+        "3) В личном чате с ботом нажмите «Управление каналами» → «Подключить канал» и перешлите (forward) любое сообщение из вашего канала.\n"
+        "   Бот проверит, что вы администратор канала, и сохранит канал в базе.\n\n"
+        "4) После подключения можно добавить модераторов, либо владелец будет получать заявки сам.\n\n"
+        "Если при подключении возникают ошибки — убедитесь, что вы действительно админ канала и бот имеет права на отправку сообщений."
     )
     bot.send_message(cq.from_user.id, text)
 
+# ========== CHANNEL MANAGEMENT ==========
 def show_channels_menu(user_id):
     bot.send_message(user_id, "🔧 Управление каналами:", reply_markup=channels_menu())
 
@@ -323,133 +598,110 @@ def show_channels_menu(user_id):
 def cq_add_channel(cq):
     bot.answer_callback_query(cq.id)
     set_state(cq.from_user.id, "wait_channel")
-    kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel"))
-    bot.send_message(cq.from_user.id, "Перешли любое сообщение из своего канала (Forward).", reply_markup=kb)
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel"))
+    bot.send_message(cq.from_user.id,
+                     "📩 Перешли ЛЮБОЕ сообщение из своего канала (Forward)\n\nТы должен быть администратором этого канала.\n\nЕсли хочешь отменить — нажми «Отмена».",
+                     reply_markup=kb)
 
 @bot.message_handler(func=lambda m: get_state(m.from_user.id) == "wait_channel", content_types=['text','photo','video','document','sticker'])
 def handle_channel_forward(m):
     pop_state(m.from_user.id)
     if not m.forward_from_chat or getattr(m.forward_from_chat, "type", "") != "channel":
-        bot.send_message(m.chat.id, "Это не пересылка из канала. Перешли сообщение из своего канала.", reply_markup=main_menu())
+        bot.send_message(m.chat.id, "❌ Это не пересылка из канала. Перешли сообщение из своего канала.", reply_markup=main_menu())
         return
     channel = m.forward_from_chat
     channel_id = channel.id
     title = getattr(channel, "title", "") or str(channel_id)
+    # проверка прав пользователя в этом канале
     try:
         member = bot.get_chat_member(channel_id, m.from_user.id)
         if member.status not in ("administrator", "creator"):
-            bot.send_message(m.chat.id, "Ты не администратор этого канала.", reply_markup=main_menu())
+            bot.send_message(m.chat.id, "❌ Ты не администратор этого канала. Подключение прервано.", reply_markup=main_menu())
             return
     except Exception as e:
-        bot.send_message(m.chat.id, f"Не удалось проверить права: {e}", reply_markup=main_menu())
+        bot.send_message(m.chat.id, f"❌ Не удалось проверить права: {e}\nУбедись, что бот добавлен в канал.", reply_markup=main_menu())
         return
-
+    # attempt to get @username for storage if available
     try:
         info = bot.get_chat(channel_id)
-        channel_key = '@' + info.username if getattr(info, 'username', None) else str(channel_id)
+        if getattr(info, 'username', None):
+            channel_key = '@' + info.username
+        else:
+            channel_key = str(channel_id)
     except Exception:
         channel_key = str(channel_id)
 
-    dbid = add_channel(m.from_user.id, channel_key, title)
-    if not dbid:
-        bot.send_message(m.from_user.id, "Не удалось сохранить канал.", reply_markup=channels_menu())
+    # доп. проверка: если канал уже сохранён (любое представление), сообщаем, что он уже добавлен
+    candidate_keys = {channel_key, channel_key.lstrip("@"), str(channel_id)}
+    found = None
+    for k in candidate_keys:
+        if USE_PG:
+            cur.execute("SELECT id FROM channels WHERE channel_id = %s", (k,))
+        else:
+            cur.execute("SELECT id FROM channels WHERE channel_id = ?", (k,))
+        r = cur.fetchone()
+        if r:
+            found = r[0]
+            break
+    if found:
+        bot.send_message(m.from_user.id, "❗ Канал уже подключён к боту.", reply_markup=channels_menu())
         return
 
+    # сохраняем канал (channel_key может быть @username или numeric id string)
+    dbid = add_channel(m.from_user.id, channel_key, title)
+    if not dbid:
+        bot.send_message(m.from_user.id, "❌ Не удалось сохранить канал (возможно, он уже добавлен).", reply_markup=channels_menu())
+        return
+    # после добавления — спросим, кто будет получать заявки (модераторы)
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("Я буду получать заявки", callback_data=f"set_mods_self:{dbid}"),
-           types.InlineKeyboardButton("Пропустить", callback_data=f"set_mods_skip:{dbid}"))
-    bot.send_message(m.from_user.id, f"Канал {title} подключён.", reply_markup=kb)
+    kb.add(types.InlineKeyboardButton("Я буду получать заявки", callback_data=f"set_mods_self:{dbid}"))
+    kb.add(types.InlineKeyboardButton("Добавить другого модератора", callback_data=f"set_mods_other:{dbid}"))
+    kb.add(types.InlineKeyboardButton("Пропустить", callback_data=f"set_mods_skip:{dbid}"))
+    # отправляем в канал сообщение с кнопкой "Предложить пост" (deep link)
+    bot_link = f"https://t.me/{BOT_USERNAME}?start=post_{dbid}" if BOT_USERNAME else None
+    kb_channel = types.InlineKeyboardMarkup()
+    if bot_link:
+        kb_channel.add(types.InlineKeyboardButton("Предложить пост", url=bot_link))
+    try:
+        bot.send_message(channel.id, f"Канал подключён к Телеформ — подписчики могут предлагать посты через бота (нажмите кнопку).", reply_markup=kb_channel)
+    except Exception:
+        # если не получилось отправить в канал — просто продолжим
+        pass
+    bot.send_message(m.from_user.id, f"✅ Канал *{title}* подключён.\nКто будет получать заявки на модерацию?", parse_mode="Markdown", reply_markup=kb)
 
+# обрабатываем выбор модераторов сразу после подключения
 @bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("set_mods_"))
 def cq_set_mods(cq):
     bot.answer_callback_query(cq.id)
-    parts = cq.data.split(":")
-    cmd = parts[0]
-    dbid = int(parts[1])
+    parts = cq.data.split(":" )
+    if len(parts) != 2:
+        bot.send_message(cq.from_user.id, "Ошибка.")
+        return
+    cmd, dbid_str = parts[0], parts[1]
+    dbid = int(dbid_str)
     if cmd == "set_mods_self":
+        # добавляем владельца как модератора
         add_channel_admin(dbid, cq.from_user.id, cq.from_user.id)
-        bot.send_message(cq.from_user.id, "Ты добавлен как модератор.", reply_markup=channels_menu())
+        bot.send_message(cq.from_user.id, "👌 Ты добавлен как модератор для этого канала.", reply_markup=channels_menu())
+    elif cmd == "set_mods_other":
+        # регистрируем состояние ожидания: перешли сообщение или укажи @username/ID
+        set_state(cq.from_user.id, f"awaiting_first_mod:{dbid}")
+        kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel"))
+        bot.send_message(cq.from_user.id, "Перешли сообщение от пользователя (forward) или отправь @username/ID, чтобы добавить его как модератора.", reply_markup=kb)
+    elif cmd == "set_mods_skip":
+        bot.send_message(cq.from_user.id, "Ок — модераторы можно добавить позже в меню канала.", reply_markup=channels_menu())
     else:
-        bot.send_message(cq.from_user.id, "Пропущено.", reply_markup=channels_menu())
+        bot.send_message(cq.from_user.id, "Неизвестная команда.", reply_markup=channels_menu())
 
-@bot.callback_query_handler(func=lambda cq: cq.data == "my_channels")
-def cq_my_channels(cq):
-    bot.answer_callback_query(cq.id)
-    cur.execute("SELECT id, channel_id, title FROM channels WHERE owner_id = ? ORDER BY created_at DESC", (cq.from_user.id,))
-    rows = cur.fetchall()
-    if not rows:
-        bot.send_message(cq.from_user.id, "У тебя пока нет подключённых каналов.", reply_markup=channels_menu())
-        return
-    kb = types.InlineKeyboardMarkup()
-    for r in rows:
-        dbid, channel_key, title = r
-        kb.add(types.InlineKeyboardButton(title or str(channel_key), callback_data=f"channel:{dbid}"))
-    kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="menu_channels"))
-    bot.send_message(cq.from_user.id, "Твои каналы:", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("channel:"))
-def cq_channel(cq):
-    bot.answer_callback_query(cq.id)
-    dbid = int(cq.data.split(":",1)[1])
-    ch = get_channel_by_dbid(dbid)
-    if not ch:
-        bot.send_message(cq.from_user.id, "Канал не найден.")
-        return
-    _, owner_id, channel_key, title = ch
-    kb = types.InlineKeyboardMarkup()
-    if BOT_USERNAME:
-        bot_link = f"https://t.me/{BOT_USERNAME}?start=post_{dbid}"
-        kb.add(types.InlineKeyboardButton("🔗 Ссылка для подписчиков", url=bot_link))
-    kb.add(types.InlineKeyboardButton("👥 Управление модераторами", callback_data=f"mods:{dbid}"))
-    kb.add(types.InlineKeyboardButton("🗑 Удалить канал", callback_data=f"delete:{dbid}"))
-    kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="my_channels"))
-    bot.send_message(cq.from_user.id, f"Управление: {title or channel_key}", reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("mods:"))
-def cq_mods(cq):
-    bot.answer_callback_query(cq.id)
-    dbid = int(cq.data.split(":",1)[1])
-    ch = get_channel_by_dbid(dbid)
-    if not ch:
-        bot.send_message(cq.from_user.id, "Канал не найден.")
-        return
-    _, owner_id, channel_key, title = ch
-    admins = list_channel_admins(dbid)
-    text = f"Модераторы канала {title or channel_key}:\n"
-    if not admins:
-        text += "— Нет модераторов —\n"
-    else:
-        for a in admins:
-            text += f"- {a}\n"
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("➕ Добавить модератора", callback_data=f"addmod:{dbid}"))
-    if admins:
-        for a in admins:
-            kb.add(types.InlineKeyboardButton(f"Удалить {a}", callback_data=f"delmod:{dbid}:{a}"))
-    kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data=f"channel:{dbid}"))
-    bot.send_message(cq.from_user.id, text, reply_markup=kb)
-
-@bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("addmod:"))
-def cq_addmod(cq):
-    bot.answer_callback_query(cq.id)
-    dbid = int(cq.data.split(":",1)[1])
-    ch = get_channel_by_dbid(dbid)
-    if not ch:
-        bot.send_message(cq.from_user.id, "Канал не найден.")
-        return
-    if cq.from_user.id != ch[1]:
-        bot.send_message(cq.from_user.id, "Добавлять модераторов может только владелец канала.")
-        return
-    set_state(cq.from_user.id, f"awaiting_add_mod:{dbid}")
-    bot.send_message(cq.from_user.id, "Перешли сообщение от пользователя (forward) или отправь @username/ID, чтобы добавить модератора.")
-
-@bot.message_handler(func=lambda m: isinstance(get_state(m.from_user.id), str) and get_state(m.from_user.id).startswith("awaiting_add_mod"), content_types=['text','photo','video','document'])
-def handle_add_mod(m):
+@bot.message_handler(func=lambda m: isinstance(get_state(m.from_user.id), str) and get_state(m.from_user.id).startswith("awaiting_first_mod"), content_types=['text','photo','video','document'])
+def handle_first_mod(m):
     state = pop_state(m.from_user.id)
     if not state:
-        bot.send_message(m.chat.id, "Ошибка состояния.")
+        bot.send_message(m.chat.id, "Сначала начните поток добавления модератора через меню канала.")
         return
     dbid = int(state.split(":",1)[1])
+    # определяем кандидата
     admin_candidate = None
     if m.forward_from:
         admin_candidate = m.forward_from.id
@@ -465,39 +717,180 @@ def handle_add_mod(m):
         try:
             admin_candidate = int(m.text.strip())
         except Exception:
-            bot.send_message(m.chat.id, "Неверный ввод.")
+            bot.send_message(m.chat.id, "Неверный ввод. Перешли сообщение от пользователя или отправь @username/ID.")
             return
     res = add_channel_admin(dbid, admin_candidate, m.from_user.id)
-    bot.send_message(m.chat.id, "Модератор добавлен." if res else "Ошибка или уже модератор.")
+    if res:
+        bot.send_message(m.chat.id, "✅ Модератор добавлен.", reply_markup=channels_menu())
+    else:
+        bot.send_message(m.chat.id, "Пользователь уже модератор или произошла ошибка.", reply_markup=channels_menu())
 
-# Offer via username flow
+# показать список своих каналов
+@bot.callback_query_handler(func=lambda cq: cq.data == "my_channels")
+def cq_my_channels(cq):
+    bot.answer_callback_query(cq.id)
+    rows = list_channels_by_owner(cq.from_user.id)
+    if not rows:
+        bot.send_message(cq.from_user.id, "📭 У тебя пока нет подключённых каналов.", reply_markup=channels_menu())
+        return
+    kb = types.InlineKeyboardMarkup()
+    for r in rows:
+        dbid, channel_id, title = r
+        kb.add(types.InlineKeyboardButton(title or str(channel_id), callback_data=f"channel:{dbid}"))
+    kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="menu_channels"))
+    bot.send_message(cq.from_user.id, "📋 Твои каналы:", reply_markup=kb)
+
+# меню конкретного канала: управление модераторами / удалить / ссылка для подписчиков
+@bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("channel:"))
+def cq_channel(cq):
+    bot.answer_callback_query(cq.id)
+    dbid = int(cq.data.split(":",1)[1])
+    ch = get_channel_by_dbid(dbid)
+    if not ch:
+        bot.send_message(cq.from_user.id, "Канал не найден.")
+        return
+    _, owner_id, channel_id, title = ch
+    kb = types.InlineKeyboardMarkup()
+    bot_link = f"https://t.me/{BOT_USERNAME}?start=post_{dbid}" if BOT_USERNAME else None
+    if bot_link:
+        kb.add(types.InlineKeyboardButton("🔗 Ссылка для подписчиков", url=bot_link))
+    kb.add(types.InlineKeyboardButton("👥 Управление модераторами", callback_data=f"mods:{dbid}"))
+    kb.add(types.InlineKeyboardButton("📣 Отправить готовое сообщение в канал", callback_data=f"promo_prepare:{dbid}"))
+    kb.add(types.InlineKeyboardButton("🗑 Удалить канал", callback_data=f"delete:{dbid}"))
+    kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="my_channels"))
+    bot.send_message(cq.from_user.id, f"⚙️ Управление: *{title or channel_id}*", parse_mode="Markdown", reply_markup=kb)
+
+# управление модераторами: список и добавление/удаление
+@bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("mods:"))
+def cq_mods(cq):
+    bot.answer_callback_query(cq.id)
+    dbid = int(cq.data.split(":",1)[1])
+    ch = get_channel_by_dbid(dbid)
+    if not ch:
+        bot.send_message(cq.from_user.id, "Канал не найден.")
+        return
+    _, owner_id, channel_id, title = ch
+    # показываем список модераторов
+    admins = list_channel_admins(dbid)
+    text = f"Модераторы канала *{title or channel_id}*:\n"
+    if not admins:
+        text += "— Нет модераторов —\n"
+    else:
+        for a in admins:
+            try:
+                info = bot.get_chat(a)
+                name = ("@" + info.username) if getattr(info, "username", None) else (getattr(info, "first_name", "") or str(a))
+            except:
+                name = str(a)
+            text += f"- {name} (ID {a})\n"
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("➕ Добавить модератора", callback_data=f"addmod:{dbid}"))
+    if admins:
+        for a in admins:
+            kb.add(types.InlineKeyboardButton(f"Удалить {a}", callback_data=f"delmod:{dbid}:{a}"))
+    kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data=f"channel:{dbid}"))
+    bot.send_message(cq.from_user.id, text, parse_mode="Markdown", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("addmod:"))
+def cq_addmod(cq):
+    bot.answer_callback_query(cq.id)
+    dbid = int(cq.data.split(":",1)[1])
+    # only owner can add mods
+    ch = get_channel_by_dbid(dbid)
+    if not ch:
+        bot.send_message(cq.from_user.id, "Канал не найден.")
+        return
+    owner_id = ch[1]
+    if cq.from_user.id != owner_id:
+        bot.send_message(cq.from_user.id, "Добавлять модераторов может только владелец канала.")
+        return
+    set_state(cq.from_user.id, f"awaiting_add_mod:{dbid}")
+    kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel"))
+    bot.send_message(cq.from_user.id, "Перешли сообщение от пользователя (forward) или отправь @username/ID, чтобы добавить модератора.", reply_markup=kb)
+
+@bot.message_handler(func=lambda m: isinstance(get_state(m.from_user.id), str) and get_state(m.from_user.id).startswith("awaiting_add_mod"), content_types=['text','photo','video','document'])
+def handle_add_mod(m):
+    state = pop_state(m.from_user.id)
+    if not state:
+        bot.send_message(m.chat.id, "Сначала выберите «Добавить модератора» в меню канала.")
+        return
+    dbid = int(state.split(":",1)[1])
+    admin_candidate = None
+    if m.forward_from:
+        admin_candidate = m.forward_from.id
+    elif m.text and m.text.strip().startswith("@"):
+        username = m.text.strip()
+        try:
+            ch = bot.get_chat(username)
+            admin_candidate = ch.id
+        except:
+            bot.send_message(m.chat.id, "Не удалось найти пользователя по @username.")
+            return
+    else:
+        try:
+            admin_candidate = int(m.text.strip())
+        except:
+            bot.send_message(m.chat.id, "Неверный ввод. Перешли сообщение от пользователя или отправь @username/ID.")
+            return
+    res = add_channel_admin(dbid, admin_candidate, m.from_user.id)
+    if res:
+        bot.send_message(m.chat.id, "✅ Модератор добавлен.")
+    else:
+        bot.send_message(m.chat.id, "Пользователь уже модератор или произошла ошибка.")
+
+@bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("delmod:"))
+def cq_delmod(cq):
+    bot.answer_callback_query(cq.id)
+    parts = cq.data.split(":")
+    if len(parts) != 3:
+        bot.send_message(cq.from_user.id, "Ошибка.")
+        return
+    dbid = int(parts[1]); admin_id = int(parts[2])
+    ch = get_channel_by_dbid(dbid)
+    if not ch:
+        bot.send_message(cq.from_user.id, "Канал не найден.")
+        return
+    owner_id = ch[1]
+    if cq.from_user.id != owner_id:
+        bot.send_message(cq.from_user.id, "Удалять модераторов может только владелец канала.")
+        return
+    remove_channel_admin(dbid, admin_id)
+    bot.send_message(cq.from_user.id, f"Модератор {admin_id} удалён.")
+
+# ========== ADDED: Handler for offer via @username/link ==========
 @bot.callback_query_handler(func=lambda cq: cq.data == "offer_via_username")
 def cq_offer_via_username(cq):
     bot.answer_callback_query(cq.id)
     set_state(cq.from_user.id, "awaiting_channel_username")
-    bot.send_message(cq.from_user.id, "Отправь @username или ссылку на канал (например https://t.me/yourchannel).")
+    kb = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel"))
+    bot.send_message(cq.from_user.id, "Отправь @username канала или ссылку на канал (например https://t.me/yourchannel).", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: get_state(m.from_user.id) == "awaiting_channel_username", content_types=['text'])
 def handle_channel_by_username(m):
     pop_state(m.from_user.id)
     text = (m.text or "").strip()
     if not text:
-        bot.send_message(m.chat.id, "Неверный ввод.", reply_markup=main_menu())
+        bot.send_message(m.chat.id, "Неверный ввод. Используй @username или ссылку на канал.", reply_markup=main_menu())
         return
 
+    # Сформируем набор кандидатных ключей для поиска в БД
     candidate_keys = set()
+
+    # Прямой ввод ссылки https://t.me/username или http://t.me/username
     if text.startswith("https://t.me/") or text.startswith("http://t.me/"):
         last = text.rstrip("/").split("/")[-1]
         if not last:
             bot.send_message(m.chat.id, "Неверная ссылка.", reply_markup=main_menu())
             return
+        # если last — номер (редко), оставим как есть; иначе добавим @
         if last.lstrip("-").isdigit():
             candidate_keys.add(last)
-            candidate_keys.add(str(int(last)))
+            candidate_keys.add(str(int(last)))  # normalized numeric
         else:
             candidate_keys.add("@" + last)
             candidate_keys.add(last)
     else:
+        # если ввели @username или numeric id
         if text.startswith("@"):
             candidate_keys.add(text)
             candidate_keys.add(text.lstrip("@"))
@@ -505,103 +898,118 @@ def handle_channel_by_username(m):
             candidate_keys.add(text)
             candidate_keys.add(str(int(text)))
         else:
+            # возможно пользователь ввёл просто username без @
             candidate_keys.add("@" + text)
             candidate_keys.add(text)
 
+    # Попытка 1: прямой поиск в БД по candidate_keys
     row = None
     for k in list(candidate_keys):
-        cur.execute("SELECT id, title, channel_id FROM channels WHERE channel_id = ?", (k,))
+        if USE_PG:
+            cur.execute("SELECT id, title, channel_id FROM channels WHERE channel_id = %s", (k,))
+        else:
+            cur.execute("SELECT id, title, channel_id FROM channels WHERE channel_id = ?", (k,))
         r = cur.fetchone()
         if r:
             row = r
             break
 
+    # Попытка 2: если не найдено, попробуем разрешить через bot.get_chat (если есть username/shortname)
     if not row:
-        # Try to resolve via get_chat
-        try:
-            if text.startswith("https://") or text.startswith("http://"):
-                last = text.rstrip("/").split("/")[-1]
-                get_arg = "@" + last if not last.lstrip("-").isdigit() else last
+        # для get_chat подготовим аргумент: если есть @username — используем, иначе используем last part
+        getchat_arg = None
+        if text.startswith("https://t.me/") or text.startswith("http://t.me/"):
+            last = text.rstrip("/").split("/")[-1]
+            if last:
+                getchat_arg = "@" + last if not last.lstrip("-").isdigit() and not last.startswith("@") else last
+        else:
+            if text.startswith("@"):
+                getchat_arg = text
+            elif text.lstrip("-").isdigit():
+                getchat_arg = text
             else:
-                if text.startswith("@") or text.lstrip("-").isdigit():
-                    get_arg = text
-                else:
-                    get_arg = "@" + text
-            chat = bot.get_chat(get_arg)
+                getchat_arg = "@" + text
+
+        try:
+            chat = bot.get_chat(getchat_arg)
+            # возможные варианты ключей, которые могли быть сохранены
             possible = set()
             possible.add(str(chat.id))
+            # Bot API возвращает channel username without @
             if getattr(chat, "username", None):
                 possible.add("@" + chat.username)
                 possible.add(chat.username)
+            # иногда id может быть negative like -100..., добавим вариант без -100 если кто-то сохранил так
+            cid = str(chat.id)
+            if cid.startswith("-100"):
+                possible.add(cid[4:])          # without -100
+                possible.add(cid.lstrip("-"))  # without minus
+            else:
+                possible.add("-100" + cid)
+                possible.add("-" + cid)
+
+            # поиск в БД по всем возможным вариантам
             for k in possible:
-                cur.execute("SELECT id, title, channel_id FROM channels WHERE channel_id = ?", (k,))
+                if USE_PG:
+                    cur.execute("SELECT id, title, channel_id FROM channels WHERE channel_id = %s", (k,))
+                else:
+                    cur.execute("SELECT id, title, channel_id FROM channels WHERE channel_id = ?", (k,))
                 r = cur.fetchone()
                 if r:
                     row = r
                     break
         except Exception:
+            # если get_chat не удался — продолжаем дальше и сообщим об ошибке позже
             row = None
 
     if not row:
-        bot.send_message(m.chat.id, "Канал не найден или не подключён.", reply_markup=main_menu())
+        bot.send_message(m.chat.id, "❌ Канал не найден или не подключён к боту. Убедитесь, что вы ввели корректный @username или ссылку, и что канал действительно подключён (через Forward).", reply_markup=main_menu())
         return
 
     dbid, title, stored_key = row
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("Анонимно", callback_data=f"deep_offer_anon:1:{dbid}"),
            types.InlineKeyboardButton("Не анонимно", callback_data=f"deep_offer_anon:0:{dbid}"))
-    bot.send_message(m.chat.id, f"Вы хотите отправить пост в канал {title or stored_key}? Выберите:", reply_markup=kb)
+    bot.send_message(m.chat.id, f"📣 Вы хотите отправить пост в канал *{title or stored_key}*? Выберите режим отправки:", parse_mode="Markdown", reply_markup=kb)
 
-# Deep link flow (start=post_dbid)
+# ========== DEEP LINK FLOW ==========
 @bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("deep_offer_anon:"))
 def cq_deeplink_offer(cq):
     bot.answer_callback_query(cq.id)
     try:
-        _, anon_str, dbid_str = cq.data.split(":",2)
+        _, anon_str, dbid_str = cq.data.split(":" ,2)
         anon_flag = True if anon_str == "1" else False
         dbid = int(dbid_str)
     except:
-        bot.send_message(cq.from_user.id, "Ошибка ссылки.")
-        return
-
-    # Check cooldown BEFORE prompting for content
+        bot.send_message(cq.from_user.id, "Ошибка ссылки."); return
+    # cooldown check
     last = get_last_published(cq.from_user.id, dbid)
-    if last and (now_ts() - last) < COOLDOWN_SECONDS:
-        left = COOLDOWN_SECONDS - (now_ts() - last)
-        bot.send_message(cq.from_user.id, f"⏳ Вы уже отправляли заявку в этот канал. Попробовать можно через {format_timedelta_seconds(left)}.", reply_markup=main_menu())
-        return
-
+    if last:
+        elapsed = now_ts() - last
+        if elapsed < COOLDOWN_SECONDS:
+            left = COOLDOWN_SECONDS - elapsed
+            bot.send_message(cq.from_user.id, f"⏳ Вы уже публиковали в этот канал. Попробовать ещё можно через {format_timedelta_seconds(left)}.", reply_markup=main_menu())
+            return
+    # prompt for content
     ch = get_channel_by_dbid(dbid)
     if not ch:
-        bot.send_message(cq.from_user.id, "Канал не найден.", reply_markup=main_menu())
-        return
-    msg = bot.send_message(cq.from_user.id, f"Отправьте текст, фото, видео или документ для канала {ch[3] or ch[2]}. Для отмены /cancel.")
+        bot.send_message(cq.from_user.id, "Канал не найден.", reply_markup=main_menu()); return
+    msg = bot.send_message(cq.from_user.id, f"📝 Отправьте текст, фото, видео или документ для канала *{ch[3] or ch[2]}*.\nДля отмены нажмите «Отмена».", parse_mode="Markdown", reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel")))
     set_state(cq.from_user.id, f"awaiting_submission:{1 if anon_flag else 0}:{dbid}")
     bot.register_next_step_handler(msg, lambda m, anon=anon_flag, target=dbid: handle_submission(m, anon, target))
 
-@bot.message_handler(commands=["cancel"])
-def cmd_cancel(message):
-    uid = message.from_user.id
-    popped = False
-    if get_state(uid):
-        pop_state(uid)
-        bot.reply_to(message, "Действие отменено.")
-        popped = True
-    if not popped:
-        bot.reply_to(message, "Нечего отменять.")
-
+# ========== HANDLE SUBMISSION ==========
 def _reject_submission_from_user(chat_id, reason=""):
     bot.send_message(chat_id, f"❌ Не удалось принять заявку. {reason}", reply_markup=main_menu())
 
-# Core: handle_submission
 def handle_submission(message, anonymous=True, target_dbid=0):
     uid = message.from_user.id
     st = pop_state(uid)
     if not st or not st.startswith("awaiting_submission"):
-        bot.send_message(uid, "Сначала начните через меню.", reply_markup=main_menu())
+        bot.send_message(uid, "Сначала начни через меню: /menu → Предложить пост.", reply_markup=main_menu())
         return
-
-    # Validate content
+    # извлечь состояние (доп. валидация)
+    # content type
     content_type = message.content_type
     text_content = message.text if content_type == 'text' else None
     file_id = None
@@ -621,52 +1029,53 @@ def handle_submission(message, anonymous=True, target_dbid=0):
     elif content_type == 'text':
         file_id = None
     else:
-        bot.send_message(uid, "Тип сообщения не поддерживается.", reply_markup=main_menu())
+        bot.send_message(uid, "Тип сообщения не поддерживается. Отправь текст, фото, видео или документ.", reply_markup=main_menu())
         return
 
+    # basic validations
     if content_type == 'text' and text_content and len(text_content) > MAX_TEXT_LENGTH:
-        _reject_submission_from_user(uid, f"Текст слишком длинный (макс {MAX_TEXT_LENGTH}).")
+        _reject_submission_from_user(uid, f"Текст слишком длинный (макс {MAX_TEXT_LENGTH} символов).")
         return
     if file_size and file_size > MAX_FILE_SIZE:
         _reject_submission_from_user(uid, "Файл слишком большой.")
         return
 
+    # require target_dbid > 0 (no "ordinary" submissions allowed)
     if not target_dbid or target_dbid <= 0:
-        bot.send_message(uid, "Ошибка: цель публикации не указана.", reply_markup=main_menu())
+        bot.send_message(uid, "Ошибка: цель публикации не указана. Пожалуйста, отправляйте заявки только в подключённые каналы.", reply_markup=main_menu())
         return
 
-    # Recheck cooldown (race conditions)
+    # recheck cooldown before saving
     last = get_last_published(uid, target_dbid)
     if last and (now_ts() - last) < COOLDOWN_SECONDS:
         left = COOLDOWN_SECONDS - (now_ts() - last)
-        bot.send_message(uid, f"⏳ Вы уже отправляли заявку в этот канал. Попробовать можно через {format_timedelta_seconds(left)}.", reply_markup=main_menu())
+        bot.send_message(uid, f"⏳ Вы уже публиковали в этот канал. Попробовать ещё можно через {format_timedelta_seconds(left)}.", reply_markup=main_menu())
         return
 
-    # Banned check
+    # banned check (channel-specific)
     if is_banned(target_dbid, uid):
         _reject_submission_from_user(uid, "Вы заблокированы для этого канала.")
         return
 
-    # Save submission
     sub_id = save_submission(uid, content_type, text_content, file_id, anonymous, target_dbid)
 
-    # IMPORTANT: set cooldown at submission time to prevent immediate spamming to moderators.
-    # This is the key change: cooldown persists in DB and will block new submissions for the same channel for COOLDOWN_SECONDS.
+    # set cooldown at submission time to prevent spamming (persisted in DB)
     try:
         set_cooldown(uid, target_dbid, now_ts())
     except Exception:
-        # non-fatal: proceed but note that cooldown might not be stored
-        logger.exception("Не удалось установить cooldown в БД")
+        logger.exception("Не удалось установить cooldown при сохранении заявки")
 
-    # Determine recipients (moderators or owner)
+    # determine recipients: channel moderators if any, else owner
+    recipients = []
     admins = list_channel_admins(target_dbid)
-    recipients = admins[:] if admins else []
-    if not recipients:
+    if admins:
+        recipients = admins[:]
+    else:
         ch = get_channel_by_dbid(target_dbid)
         if ch:
             recipients = [ch[1]]
 
-    # Send submission to recipients (moderators/owner)
+    # send submission to each recipient (moderators)
     for r in recipients:
         try:
             if anonymous:
@@ -682,20 +1091,18 @@ def handle_submission(message, anonymous=True, target_dbid=0):
             else:
                 bot.forward_message(r, uid, message.message_id)
         except Exception:
-            logger.exception("Ошибка при отправке заявки получателю %s", r)
-        # control buttons (accept / reject / reply)
+            # игнорируем сбои по получателям
+            pass
+        # send control message with buttons
         kb = types.InlineKeyboardMarkup()
         kb.add(types.InlineKeyboardButton("✅ Принять", callback_data=f"accept:{sub_id}"),
                types.InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{sub_id}"))
         kb.add(types.InlineKeyboardButton("✉️ Ответить автору", callback_data=f"reply:{sub_id}"))
-        try:
-            bot.send_message(r, f"🔔 Контроль заявки #{sub_id}", reply_markup=kb)
-        except Exception:
-            logger.exception("Не удалось отправить контрольное сообщение получателю %s", r)
+        bot.send_message(r, f"🔔 Контроль заявки #{sub_id}", reply_markup=kb)
 
     bot.send_message(uid, "✅ Ваша заявка отправлена на рассмотрение. Спасибо!", reply_markup=main_menu())
 
-# Moderator actions: accept/reject/reply (uses existing channel_admins/owner checks)
+# ========== ADMIN ACTIONS ON SUBMISSIONS (с проверкой прав) ==========
 @bot.callback_query_handler(func=lambda cq: cq.data and any(cq.data.startswith(pref) for pref in ("accept:", "reject:", "reply:")))
 def cq_admin_submission_actions(cq):
     bot.answer_callback_query(cq.id)
@@ -710,7 +1117,7 @@ def cq_admin_submission_actions(cq):
         bot.send_message(cq.from_user.id, "Заявка не найдена."); return
     sub_id, user_id, content_type, text_content, file_id, status, created_at, anonymous, target_dbid = submission
 
-    # rights check: owner or channel admin
+    # проверка прав: модератор канала или владелец
     if target_dbid and target_dbid > 0:
         ch = get_channel_by_dbid(target_dbid)
         if not ch:
@@ -729,8 +1136,9 @@ def cq_admin_submission_actions(cq):
             bot.send_message(user_id, f"✅ Ваша заявка #{sub_id} принята модератором.")
         except:
             pass
-        # publish immediately to channel and mark published (this function below handles cooldown on publish as well)
-        handle_publish_to_channel_by_dbid(cq.from_user.id, sub_id, target_dbid)
+        # publish to channel
+        if target_dbid and target_dbid > 0:
+            handle_publish_to_channel_by_dbid(cq.from_user.id, sub_id, target_dbid)
         return
 
     if action == "reject":
@@ -743,16 +1151,18 @@ def cq_admin_submission_actions(cq):
         return
 
     if action == "reply":
+        # set state to awaiting reply for this moderator
         set_state(cq.from_user.id, f"awaiting_reply:{sub_id}")
-        msg = bot.send_message(cq.from_user.id, f"Напишите ответ автору заявки #{sub_id} (или /cancel).")
+        msg = bot.send_message(cq.from_user.id, f"✍️ Напишите ответ автору заявки #{sub_id} (или нажмите Отмена).", reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel")))
         bot.register_next_step_handler(msg, lambda m, sid=sub_id: send_reply_to_author(m, sid))
         return
 
+# ========== PUBLISH TO CHANNEL (с логами и проверками) ==========
 def handle_publish_to_channel_by_dbid(requester_id, sub_id, chan_dbid):
     ch = get_channel_by_dbid(chan_dbid)
     if not ch:
         bot.send_message(requester_id, "Канал не найден."); return
-    _, owner_id, channel_key, title = ch
+    _, owner_id, channel_id, title = ch
     sub = get_submission(sub_id)
     if not sub:
         bot.send_message(requester_id, "Заявка не найдена."); return
@@ -770,7 +1180,7 @@ def handle_publish_to_channel_by_dbid(requester_id, sub_id, chan_dbid):
         except:
             author_str = ""
 
-    target = channel_key
+    target = channel_id
     try:
         if content_type == 'text':
             bot.send_message(target, author_str + (text_content or ""))
@@ -780,20 +1190,20 @@ def handle_publish_to_channel_by_dbid(requester_id, sub_id, chan_dbid):
             bot.send_video(target, file_id, caption=(author_str + (text_content or "")))
         elif content_type == 'document':
             bot.send_document(target, file_id, caption=(author_str + (text_content or "")))
+        # mark as published
         set_submission_status(sub_id, "published", moderator_id=requester_id)
-        # Ensure cooldown is set at publish as well (redundant but safe)
+        # set cooldown for this user-channel
+        set_cooldown(user_id, chan_dbid, now_ts())
+        # notify requester (moderator) and author
+        bot.send_message(requester_id, f"✅ Заявка #{sub_id} опубликована в {title or channel_id}.")
         try:
-            set_cooldown(user_id, chan_dbid, now_ts())
-        except Exception:
-            logger.exception("Не удалось обновить cooldown при публикации")
-        bot.send_message(requester_id, f"✅ Заявка #{sub_id} опубликована в {title or channel_key}.")
-        try:
-            bot.send_message(user_id, f"✅ Ваше сообщение #{sub_id} опубликовано в канал {title or channel_key}.")
+            bot.send_message(user_id, f"✅ Ваше сообщение #{sub_id} опубликовано в канал *{title or channel_id}*.", parse_mode="Markdown")
         except:
             pass
     except Exception as e:
-        bot.send_message(requester_id, f"Ошибка при публикации: {e}\nУбедитесь, что бот админ в канале и имеет права.")
+        bot.send_message(requester_id, f"Ошибка при публикации: {e}\nУбедитесь, что бот админ в канале и имеет права на отправку сообщений.")
 
+# ========== SEND REPLY TO AUTHOR ==========
 def send_reply_to_author(message, sub_id):
     state = pop_state(message.from_user.id)
     try:
@@ -801,34 +1211,171 @@ def send_reply_to_author(message, sub_id):
         if not sub:
             bot.send_message(message.from_user.id, "Заявка не найдена."); return
         user_id = sub[1]
-        bot.send_message(user_id, f"Ответ модератора по заявке #{sub_id}:\n\n{message.text}")
+        bot.send_message(user_id, f"✉️ Ответ модератора по заявке #{sub_id}:\n\n{message.text}")
         bot.send_message(message.from_user.id, "Ответ отправлен.")
-        # log action
-        ts = now_ts()
-        cur.execute("INSERT INTO submission_actions (submission_id, moderator_id, action, note, created_at) VALUES (?, ?, ?, ?, ?)", (sub_id, message.from_user.id, 'reply', message.text or '', ts))
-        db.commit()
+        # логируем действие reply
+        try:
+            if USE_PG:
+                cur.execute("INSERT INTO submission_actions (submission_id, moderator_id, action, note, created_at) VALUES (%s, %s, %s, %s, %s)", (sub_id, message.from_user.id, 'reply', message.text or '', now_ts()))
+                db.commit()
+            else:
+                cur.execute("INSERT INTO submission_actions (submission_id, moderator_id, action, note, created_at) VALUES (?, ?, ?, ?, ?)", (sub_id, message.from_user.id, 'reply', message.text or '', now_ts()))
+                db.commit()
+        except Exception:
+            pass
     except Exception:
-        bot.send_message(message.from_user.id, "Не удалось отправить ответ (возможно пользователь закрыл диалог).")
+        bot.send_message(message.from_user.id, "Не удалось отправить ответ (возможно, пользователь закрыл диалог).")
 
+# ========== PROMO PREPARE (owner posts a ready message with bot link) ==========
+@bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("promo_prepare:"))
+def cq_promo_prepare(cq):
+    bot.answer_callback_query(cq.id)
+    dbid = int(cq.data.split(":",1)[1])
+    ch = get_channel_by_dbid(dbid)
+    if not ch:
+        bot.send_message(cq.from_user.id, "Канал не найден."); return
+    _, owner_id, channel_id, title = ch
+    if cq.from_user.id != owner_id:
+        bot.send_message(cq.from_user.id, "Эту операцию может выполнять только владелец канала."); return
+    bot_link = f"https://t.me/{BOT_USERNAME}?start=post_{dbid}" if BOT_USERNAME else None
+    text = f"📣 Хотите отправить пост в канал *{title or channel_id}*? Нажмите кнопку и предложите пост через бота — он попадёт на модерацию."
+    kb = types.InlineKeyboardMarkup()
+    if bot_link:
+        kb.add(types.InlineKeyboardButton("Предложить пост", url=bot_link))
+    try:
+        # try to send using numeric id or username
+        try:
+            bot.send_message(channel_id, text, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            # maybe stored channel_id is @username, resolve and send
+            if str(channel_id).startswith('@'):
+                try:
+                    bot.send_message(channel_id, text, parse_mode="Markdown", reply_markup=kb)
+                except Exception as e:
+                    raise e
+        bot.send_message(cq.from_user.id, "Готовое сообщение отправлено в канал.", reply_markup=channels_menu())
+    except Exception as e:
+        bot.send_message(cq.from_user.id, f"Ошибка при отправке в канал: {e}", reply_markup=channels_menu())
+
+# ========== DELETE CHANNEL ==========
+@bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("delete:"))
+def cq_delete(cq):
+    bot.answer_callback_query(cq.id)
+    dbid = int(cq.data.split(":",1)[1])
+    ch = get_channel_by_dbid(dbid)
+    if not ch:
+        bot.send_message(cq.from_user.id, "Канал не найден."); return
+    _, owner_id, _, title = ch
+    if cq.from_user.id != owner_id:
+        bot.send_message(cq.from_user.id, "Удалять канал может только его владелец."); return
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(types.InlineKeyboardButton("✅ Да, удалить", callback_data=f"delete_yes:{dbid}"),
+           types.InlineKeyboardButton("❌ Отмена", callback_data="my_channels"))
+    bot.send_message(cq.from_user.id, f"Вы действительно хотите удалить канал *{title or ''}*?", parse_mode="Markdown", reply_markup=kb)
+
+@bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("delete_yes:"))
+def cq_delete_yes(cq):
+    bot.answer_callback_query(cq.id)
+    dbid = int(cq.data.split(":",1)[1])
+    ch = get_channel_by_dbid(dbid)
+    if not ch:
+        bot.send_message(cq.from_user.id, "Канал не найден."); return
+    if cq.from_user.id != ch[1]:
+        bot.send_message(cq.from_user.id, "Удалять канал может только владелец."); return
+    remove_channel(dbid)
+    bot.send_message(cq.from_user.id, "Канал удалён.", reply_markup=main_menu())
+
+# ========== Бан пользователя для канала (owner только) ==========
+@bot.message_handler(commands=['ban'])
+def cmd_ban(message):
+    # формат: /ban <channel_dbid> <user_id>
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        bot.send_message(message.chat.id, "Использование: /ban <channel_dbid> <user_id>")
+        return
+    try:
+        dbid = int(parts[1]); uid = int(parts[2])
+    except:
+        bot.send_message(message.chat.id, "Неверные аргументы.")
+        return
+    ch = get_channel_by_dbid(dbid)
+    if not ch:
+        bot.send_message(message.chat.id, "Канал не найден.")
+        return
+    if message.from_user.id != ch[1]:
+        bot.send_message(message.chat.id, "Только владелец канала может банить пользователей.")
+        return
+    res = add_ban(dbid, uid, message.from_user.id)
+    bot.send_message(message.chat.id, "Пользователь заблокирован для этого канала." if res else "Пользователь уже заблокирован.")
+
+@bot.message_handler(commands=['unban'])
+def cmd_unban(message):
+    # формат: /unban <channel_dbid> <user_id>
+    parts = (message.text or "").split()
+    if len(parts) != 3:
+        bot.send_message(message.chat.id, "Использование: /unban <channel_dbid> <user_id>")
+        return
+    try:
+        dbid = int(parts[1]); uid = int(parts[2])
+    except:
+        bot.send_message(message.chat.id, "Неверные аргументы.")
+        return
+    ch = get_channel_by_dbid(dbid)
+    if not ch:
+        bot.send_message(message.chat.id, "Канал не найден.")
+        return
+    if message.from_user.id != ch[1]:
+        bot.send_message(message.chat.id, "Только владелец канала может снимать блокировку.")
+        return
+    remove_ban(dbid, uid)
+    bot.send_message(message.chat.id, "Пользователь разблокирован.")
+
+# ========== UNIVERSAL CANCEL ==========
+@bot.callback_query_handler(func=lambda cq: cq.data == "cancel")
+def cq_cancel(cq):
+    bot.answer_callback_query(cq.id, "Действие отменено.")
+    pop_state(cq.from_user.id)
+    bot.send_message(cq.from_user.id, "Действие отменено.", reply_markup=main_menu())
+
+# ========== UNEXPECTED INPUT HANDLER (when in state) ==========
+@bot.message_handler(func=lambda m: get_state(m.from_user.id) is not None)
+def handle_unexpected_input(m):
+    st = get_state(m.from_user.id)
+    bot.send_message(m.chat.id, "Я сейчас ожидаю конкретные данные — либо отправь их, либо нажми «Отмена». Для возврата в меню напиши /menu", reply_markup=types.ReplyKeyboardRemove())
+
+# ========== DEFAULT PRIVATE MESSAGE HANDLER ==========
+@bot.message_handler(func=lambda m: (m.chat.type == 'private') and (get_state(m.from_user.id) is None) and (m.text is not None) and (not m.text.startswith('/')) , content_types=['text'])
+def handle_private_default(m):
+    bot.send_message(m.chat.id, "Чтобы войти в меню напишите /start")
+
+# ========== Показать pending заявки для модератора ==========
 @bot.message_handler(commands=['pending'])
 def cmd_pending(message):
     uid = message.from_user.id
-    cur.execute("SELECT channel_dbid FROM channel_admins WHERE admin_user_id = ?", (uid,))
-    admin_rows = [r[0] for r in cur.fetchall()]
-    cur.execute("SELECT id FROM channels WHERE owner_id = ?", (uid,))
-    owner_rows = [r[0] for r in cur.fetchall()]
+    # найдем все каналы, где пользователь модератор или владелец
+    if USE_PG:
+        cur.execute("SELECT channel_dbid FROM channel_admins WHERE admin_user_id = %s", (uid,))
+        admin_rows = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT id FROM channels WHERE owner_id = %s", (uid,))
+        owner_rows = [r[0] for r in cur.fetchall()]
+    else:
+        cur.execute("SELECT channel_dbid FROM channel_admins WHERE admin_user_id = ?", (uid,))
+        admin_rows = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT id FROM channels WHERE owner_id = ?", (uid,))
+        owner_rows = [r[0] for r in cur.fetchall()]
     watch_dbids = set(admin_rows + owner_rows)
     if not watch_dbids:
         bot.send_message(uid, "Вы не модератор и не владелец ни одного канала.")
         return
-    placeholders = ','.join('?' for _ in watch_dbids)
+    # получить pending заявки для этих каналов
+    placeholders = ','.join('%s' for _ in watch_dbids) if USE_PG else ','.join('?' for _ in watch_dbids)
     query = f"SELECT id, user_id, content_type, text_content, file_id, created_at, anonymous, target_channel_dbid FROM submissions WHERE status = 'pending' AND target_channel_dbid IN ({placeholders}) ORDER BY created_at DESC"
     cur.execute(query, tuple(watch_dbids))
     rows = cur.fetchall()
     if not rows:
         bot.send_message(uid, "Нет ожидающих заявок.")
         return
-    for r in rows[:20]:
+    for r in rows[:20]:  # ограничим вывод
         sid, user_id, ctype, txt, fid, created_at, anon, tdb = r
         title = f"Заявка #{sid} — {'анонимно' if anon else 'неанонимно'} — канал {tdb}"
         if ctype == 'text':
@@ -836,28 +1383,16 @@ def cmd_pending(message):
         else:
             bot.send_message(uid, f"{title}\nТип: {ctype}\nID файла: {fid}", reply_markup=types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("✅ Принять", callback_data=f"accept:{sid}"), types.InlineKeyboardButton("❌ Отклонить", callback_data=f"reject:{sid}"), types.InlineKeyboardButton("✉️ Ответить автору", callback_data=f"reply:{sid}")))
 
-# universal cancel
-@bot.callback_query_handler(func=lambda cq: cq.data == "cancel")
-def cq_cancel(cq):
-    bot.answer_callback_query(cq.id, "Действие отменено.")
-    pop_state(cq.from_user.id)
-    bot.send_message(cq.from_user.id, "Действие отменено.", reply_markup=main_menu())
-
-@bot.message_handler(func=lambda m: get_state(m.from_user.id) is not None)
-def handle_unexpected_input(m):
-    bot.send_message(m.chat.id, "Я сейчас жду конкретные данные. Отправьте их или /cancel.", reply_markup=types.ReplyKeyboardRemove())
-
-@bot.message_handler(func=lambda m: (m.chat.type == 'private') and (get_state(m.from_user.id) is None) and (m.text is not None) and (not m.text.startswith('/')) , content_types=['text'])
-def handle_private_default(m):
-    bot.send_message(m.chat.id, "Чтобы войти в меню напишите /start")
-
-# ========== WEBHOOK: Flask ==========
+# ========== WEBHOOK: Flask-приложение для Telegram ==========
 app = Flask(__name__)
+
+# health check
 @app.route("/", methods=["GET"])
 def index():
     return "OK", 200
 
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
+
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def telegram_webhook():
     if request.headers.get("content-type") == "application/json":
@@ -875,24 +1410,28 @@ def telegram_webhook():
 def setup_webhook():
     webhook_url = WEBHOOK_BASE.rstrip("/") + WEBHOOK_PATH
     try:
+        logger.info("Removing old webhook (if any)...")
         bot.remove_webhook()
     except Exception:
         pass
     try:
+        logger.info("Setting webhook to: %s", webhook_url)
         ok = bot.set_webhook(url=webhook_url)
         if not ok:
             logger.error("set_webhook returned False")
+        else:
+            logger.info("Webhook установлен успешно")
     except Exception as e:
         logger.exception("Не удалось установить webhook: %s", e)
         raise
 
-# Try to set webhook (if running under gunicorn/render)
+# Попытка установки webhook при импорте (gunicorn будет импортировать модуль)
 try:
     setup_webhook()
 except Exception as e:
     logger.error("Ошибка при установке webhook: %s", e)
 
-# ========== RUN (local) ==========
+# ========== Запуск приложения (локально) ==========
 if __name__ == "__main__":
-    logger.info("Запуск Flask на 0.0.0.0:%s", PORT)
+    logger.info("Запуск Flask (local) на 0.0.0.0:%s", PORT)
     app.run(host="0.0.0.0", port=PORT)
