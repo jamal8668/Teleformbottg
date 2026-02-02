@@ -1429,3 +1429,149 @@ except Exception as e:
 if __name__ == "__main__":
     logger.info("Запуск Flask (local) на 0.0.0.0:%s", PORT)
     app.run(host="0.0.0.0", port=PORT)
+
+
+
+# ------------------ ADMIN BUTTONS (added) ------------------
+# Добавляет inline-кнопки админа: Принять, Отклонить, Комментарий, Опубликовать, Запланировать
+# Минимальное вмешательство: код сам зарегистрирует обработчики, если в модуле уже есть объект `bot`.
+# Чтобы включить — убедитесь, что переменная `bot` существует (обычно TeleBot instance).
+# Настройте список админов в переменной ADMINS (замените 123456789 на реальные id).
+
+try:
+    from telebot import types
+except Exception:
+    types = None  # если telebot не установлен — обработчики не будут зарегистрированы
+
+ADMINS = [123456789]  # <- Замените на реальные Telegram user_id админов
+
+# Временное хранилище для ожидания комментариев и расписаний: {admin_id: {"proposal_id":..., "action":...}}
+_admin_pending_actions = {}
+
+def _make_admin_kb(proposal_id: str, chat_id: int, message_id: int):
+    """
+    Возвращает InlineKeyboardMarkup с нужными кнопками.
+    callback_data формат: admin|<action>|<proposal_id>|<chat_id>|<message_id>
+    Действия: accept, reject, comment, publish, schedule
+    """
+    kb = types.InlineKeyboardMarkup(row_width=3)
+    kb.add(
+        types.InlineKeyboardButton("✅ Принять", callback_data=f"admin|accept|{proposal_id}|{chat_id}|{message_id}"),
+        types.InlineKeyboardButton("❌ Отклонить", callback_data=f"admin|reject|{proposal_id}|{chat_id}|{message_id}"),
+        types.InlineKeyboardButton("💬 Комментарий", callback_data=f"admin|comment|{proposal_id}|{chat_id}|{message_id}")
+    )
+    kb.add(
+        types.InlineKeyboardButton("📢 Опубликовать", callback_data=f"admin|publish|{proposal_id}|{chat_id}|{message_id}"),
+        types.InlineKeyboardButton("⏰ Запланировать", callback_data=f"admin|schedule|{proposal_id}|{chat_id}|{message_id}")
+    )
+    return kb
+
+def attach_admin_buttons_to_message(chat_id: int, message_id: int, proposal_id: str, bot_instance=None):
+    """
+    Удобная функция: присоединяет админ-кнопки к существующему сообщению (редактирует reply_markup).
+    Если не получилось (например, бот не админ в чате) — отправляет отдельное сообщение с кнопками.
+    Использование: вызовите attach_admin_buttons_to_message(chat_id, message_id, proposal_id, bot)
+    """
+    b = bot_instance if bot_instance is not None else globals().get("bot")
+    if b is None:
+        raise RuntimeError("Bot instance not found. Передайте bot_instance в функцию или убедитесь, что переменная `bot` существует.")
+    kb = _make_admin_kb(proposal_id, chat_id, message_id)
+    try:
+        b.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=kb)
+    except Exception as e:
+        # fallback: send a control message in same chat
+        try:
+            b.send_message(chat_id, f"Админ-панель для предложения {proposal_id} (ориг. сообщение #{message_id}):", reply_markup=kb)
+        except Exception:
+            # последний вариант: отправить сообщение админу (первому в списке) если возможно
+            if ADMINS and isinstance(ADMINS, (list, tuple)):
+                try:
+                    b.send_message(ADMINS[0], f"Не удалось прикрепить кнопки в чат {chat_id}. Предложение {proposal_id}, сообщение {message_id}. Ошибка: {e}")
+                except Exception:
+                    pass
+
+# Регистрация обработчиков только если в модуле есть объект `bot` и telebot доступен
+if types is not None and globals().get("bot") is not None:
+    _bot = globals().get("bot")
+
+    @_bot.callback_query_handler(func=lambda cq: cq.data and cq.data.startswith("admin|"))
+    def _admin_callback_handler(call):
+        try:
+            parts = call.data.split("|")
+            # format: admin|action|proposal_id|chat_id|message_id
+            _, action, proposal_id, chat_id_str, message_id_str = parts
+            chat_id = int(chat_id_str)
+            message_id = int(message_id_str)
+            user_id = call.from_user.id
+        except Exception as e:
+            _bot.answer_callback_query(call.id, "Ошибка разбора данных.", show_alert=True)
+            return
+
+        # Проверка прав
+        if user_id not in ADMINS:
+            _bot.answer_callback_query(call.id, "У вас нет прав администратора.", show_alert=True)
+            return
+
+        if action in ("accept", "reject", "publish"):
+            # Простая обработка: редактируем кнопки, фиксируем статус
+            status_map = {"accept": "✅ Принято", "reject": "❌ Отклонено", "publish": "📢 Опубликовано"}
+            status_text = status_map.get(action, action)
+            try:
+                # обновляем текст под кнопками — добавляем строку статуса
+                _bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=None)
+            except Exception:
+                pass
+            try:
+                _bot.send_message(call.message.chat.id, f"Действие выполнено: {status_text} (предложение {proposal_id})")
+                _bot.answer_callback_query(call.id, f"{status_text}", show_alert=False)
+            except Exception:
+                _bot.answer_callback_query(call.id, "Действие выполнено.", show_alert=False)
+            return
+
+        if action in ("comment", "schedule"):
+            # На следующую текстовую реплику админа сохраняем ожидание
+            _admin_pending_actions[user_id] = {"proposal_id": proposal_id, "action": action, "chat_id": chat_id, "message_id": message_id}
+            prompt = "Напишите комментарий к предложению:" if action == "comment" else "Отправьте дату/время планирования (например: 2026-02-25 18:00):"
+            _bot.answer_callback_query(call.id, "Ожидаю вашего сообщения..." , show_alert=False)
+            _bot.send_message(user_id, f"{prompt}\n\n(Для отмены отправьте /cancel)")
+            return
+
+    @_bot.message_handler(commands=["cancel"])
+    def _admin_cancel(message):
+        uid = message.from_user.id
+        if uid in _admin_pending_actions:
+            _admin_pending_actions.pop(uid, None)
+            _bot.reply_to(message, "Действие отменено.")
+        else:
+            _bot.reply_to(message, "Нечего отменять.")
+
+    @_bot.message_handler(func=lambda m: m.from_user.id in _admin_pending_actions, content_types=["text"])
+    def _admin_pending_text_handler(message):
+        uid = message.from_user.id
+        pending = _admin_pending_actions.pop(uid, None)
+        if not pending:
+            _bot.reply_to(message, "Время ожидания истекло или действие недоступно.")
+            return
+        proposal_id = pending["proposal_id"]
+        action = pending["action"]
+        try:
+            if action == "comment":
+                comment = message.text.strip()
+                # Простая реализация: отправляем комментарий в тот же чат где предложение или админу уведомление.
+                target_chat = pending.get("chat_id")
+                _bot.send_message(target_chat, f"Комментарий админа к предложению {proposal_id}:\n\n{comment}")
+                _bot.reply_to(message, "Комментарий отправлен.")
+            elif action == "schedule":
+                schedule_text = message.text.strip()
+                target_chat = pending.get("chat_id")
+                _bot.send_message(target_chat, f"Предложение {proposal_id} запланировано на: {schedule_text} (установлено администратором)")
+                _bot.reply_to(message, "Дата/время сохранены (пока в виде текста).")
+            else:
+                _bot.reply_to(message, "Неизвестное действие.")
+        except Exception as e:
+            _bot.reply_to(message, f"Ошибка при выполнении действия: {e}")
+
+# Пометка: если вы хотите автоматически прикреплять кнопки при создании предложения,
+# вставьте в место кода, где вы отправляете сообщение с предложением вызов:
+#     attach_admin_buttons_to_message(chat_id, message_id, proposal_id, bot)
+# ------------------ END ADMIN BUTTONS ------------------
